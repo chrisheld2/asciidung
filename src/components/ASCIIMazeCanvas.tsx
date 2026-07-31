@@ -339,6 +339,15 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
     const animate = () => {
       animationFrameId = requestAnimationFrame(animate);
 
+      // Keep the animation loop alive so closing the pause menu resumes immediately,
+      // but do not update the scene or issue WebGL renders while the game is paused.
+      if (isPausedRef.current) {
+        lastFrameTime = performance.now();
+        frameCount = 0;
+        lastFpsTime = lastFrameTime;
+        return;
+      }
+
       const now = performance.now();
       const delta = Math.min(0.05, (now - lastFrameTime) / 1000);
       lastFrameTime = now;

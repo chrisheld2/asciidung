@@ -1,11 +1,8 @@
 import * as THREE from 'three';
 
-// Module-scoped scratchpad objects for ZERO-ALLOCATION frustum culling
+// Module-scoped scratchpad objects for zero-allocation frustum culling
 const _tempFrustum = new THREE.Frustum();
 const _tempProjScreenMatrix = new THREE.Matrix4();
-const _tempBox3 = new THREE.Box3();
-const _tempVecMin = new THREE.Vector3();
-const _tempVecMax = new THREE.Vector3();
 
 export interface SpatialChunk {
   chunkX: number;
@@ -48,8 +45,8 @@ export class FrustumCuller {
     const numChunksX = Math.ceil(cols / this.chunkSize);
     const numChunksZ = Math.ceil(rows / this.chunkSize);
 
-    // Generous padding margin around each chunk so edge geometry, trees, and mountains are never falsely culled
-    const paddingMargin = 12.0;
+    // Covers the widest scaled tree sprite without making adjacent chunks overlap excessively.
+    const paddingMargin = 2.0;
 
     for (let cz = 0; cz < numChunksZ; cz++) {
       for (let cx = 0; cx < numChunksX; cx++) {
@@ -98,9 +95,12 @@ export class FrustumCuller {
   public updateVisibility(camera: THREE.Camera): void {
     if (this.chunks.length === 0) return;
 
-    // Ensure all spatial chunks remain 100% visible so no part of the world view is ever cut off or truncated
+    _tempProjScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    _tempFrustum.setFromProjectionMatrix(_tempProjScreenMatrix);
+
     for (let i = 0; i < this.chunks.length; i++) {
-      this.chunks[i].group.visible = true;
+      const chunk = this.chunks[i];
+      chunk.group.visible = _tempFrustum.intersectsBox(chunk.bounds);
     }
   }
 }

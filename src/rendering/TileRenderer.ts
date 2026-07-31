@@ -32,6 +32,14 @@ interface TreeInstanceData {
   scaleZ: number;
 }
 
+interface TerrainInstanceData {
+  x: number;
+  y: number;
+  z: number;
+  height: number;
+  spriteIndex: number;
+}
+
 /**
  * TileRenderer
  * High-performance, GPU-offloaded tile rendering architecture.
@@ -82,6 +90,9 @@ export class TileRenderer {
   private lastTargetX = NaN;
   private lastTargetZ = NaN;
   private lastSunY = NaN;
+  private lastShadowSunX = NaN;
+  private lastShadowSunY = NaN;
+  private lastShadowSunZ = NaN;
 
   constructor(container: HTMLDivElement, isOrthographic = true, theme: ColorTheme) {
     this.poolManager = TilePoolManager.getInstance();
@@ -162,6 +173,10 @@ export class TileRenderer {
     this.dirLight.shadow.camera.bottom = -65;
     this.dirLight.shadow.bias = -0.0003;
     this.dirLight.shadow.normalBias = 0.02;
+    // The world is static, so only refresh the shadow atlas when the sun moves
+    // meaningfully instead of redrawing every shadow caster every frame.
+    this.dirLight.shadow.autoUpdate = false;
+    this.dirLight.shadow.needsUpdate = true;
     this.scene.add(this.dirLight);
 
     this.fillLight = new THREE.DirectionalLight(theme.light, 0.8);
@@ -174,8 +189,9 @@ export class TileRenderer {
     this.orbLight = new THREE.PointLight(0x38bdf8, 2.0, 40);
     this.scene.add(this.orbLight);
 
-    // Point Light Pool (18 closest active dynamic lights for realtime mode)
-    const MAX_POOLED_LIGHTS = 18;
+    // Forward rendering pays the point-light cost in every lit fragment. A strict
+    // nearest-six budget is a predictable console/desktop-quality performance tier.
+    const MAX_POOLED_LIGHTS = 6;
     for (let i = 0; i < MAX_POOLED_LIGHTS; i++) {
       const pl = new THREE.PointLight(0xffaa44, 0, 16);
       pl.castShadow = false;
@@ -270,113 +286,121 @@ export class TileRenderer {
     this.floorMesh.position.set(0, -0.5, 0);
     this.scene.add(this.floorMesh);
 
-    // 2. Setup Spatial Chunking for Frustum Culling
+    // 2. Setup tree chunks and one GPU-driven terrain batch.
+    // Terrain is cheap to keep resident as a single mesh; trees remain chunked so
+    // their alpha-tested pixels and shadow casters can be culled aggressively.
     const chunks = this.frustumCuller.createChunks(cols, rows, centerX, centerZ, 40);
     chunks.forEach((chunk) => {
       this.worldGroup.add(chunk.group);
     });
 
-    // Grouping by (spriteIndex, height) per chunk
-    interface GroupData {
-      spriteIndex: number;
-      height: number;
-      positions: Array<{ x: number; y: number; z: number }>;
+    const terrainInstances: TerrainInstanceData[] = [];
+    const treeInstancesByChunk = chunks.map(() => ({
+      oak: [] as TreeInstanceData[],
+      pine: [] as TreeInstanceData[],
+      bush: [] as TreeInstanceData[],
+      mushroom: [] as TreeInstanceData[],
+    }));
+    const chunksPerRow = Math.ceil(cols / this.frustumCuller.chunkSize);
+
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const idx = tileEngine.getIndex(r, c);
+        if (tileEngine.blockTypeIds[idx] === 255) continue;
+
+        const cell = worldGrid[r][c];
+        if (!cell) continue;
+
+        const posX = c - centerX;
+        const posZ = r - centerZ;
+        const isTree = cell.type === 'tree_oak' || cell.type === 'tree_pine' || cell.type === 'bush';
+        const isMushroom = cell.type === 'mushroom';
+
+        if (isTree || isMushroom) {
+          terrainInstances.push({
+            x: posX,
+            y: 0.1 / 2 - 0.5,
+            z: posZ,
+            height: 0.1,
+            spriteIndex: cell.spriteIndex ?? SPRITE_DEFS.grass.spriteIndex,
+          });
+
+          const chunkX = Math.floor(c / this.frustumCuller.chunkSize);
+          const chunkZ = Math.floor(r / this.frustumCuller.chunkSize);
+          const treeChunk = treeInstancesByChunk[chunkZ * chunksPerRow + chunkX];
+          const seedVal = r * 31 + c * 17;
+          const pseudoRng = Math.abs(Math.sin(seedVal));
+          const rotY = pseudoRng * Math.PI * 2;
+          const scaleVar = 0.85 + (pseudoRng % 0.3);
+          const instance: TreeInstanceData = {
+            x: posX,
+            y: -0.45,
+            z: posZ,
+            rotY,
+            scaleX: scaleVar,
+            scaleY: cell.type === 'tree_pine' ? scaleVar * 1.15 : scaleVar,
+            scaleZ: scaleVar,
+          };
+
+          if (cell.type === 'tree_oak') treeChunk.oak.push(instance);
+          else if (cell.type === 'tree_pine') treeChunk.pine.push(instance);
+          else if (cell.type === 'bush') treeChunk.bush.push(instance);
+          else treeChunk.mushroom.push(instance);
+          continue;
+        }
+
+        if (cell.type.startsWith('mountain') || cell.type === 'rock') {
+          continue; // Handled by the unified mountain mesh.
+        }
+
+        const height = tileEngine.heights[idx];
+        terrainInstances.push({
+          x: posX,
+          y: height / 2 - 0.5,
+          z: posZ,
+          height,
+          spriteIndex: tileEngine.spriteIndices[idx],
+        });
+      }
     }
 
-    const opaqueSideMat = this.poolManager.getOpaqueSideMaterial();
-    const topMat = this.poolManager.getTopAtlasMaterial(spritePack);
-    const materials = [opaqueSideMat, opaqueSideMat, topMat, opaqueSideMat, opaqueSideMat, opaqueSideMat];
+    if (terrainInstances.length > 0) {
+      const terrainGeometry = this.poolManager.getBatchedBlockGeometry();
+      const terrainMaterials = [
+        this.poolManager.getOpaqueSideMaterial(),
+        this.poolManager.getTopAtlasMaterial(spritePack),
+      ];
+      const terrainMesh = this.poolManager.acquireInstancedMesh(
+        terrainGeometry,
+        terrainMaterials,
+        terrainInstances.length
+      );
+      const spriteIndices = new Float32Array(terrainInstances.length);
+      _tempQuat_1.identity();
 
-    // Build chunks
-    chunks.forEach((chunk) => {
-      const groups = new Map<string, GroupData>();
-      const chunkOakInstances: TreeInstanceData[] = [];
-      const chunkPineInstances: TreeInstanceData[] = [];
-      const chunkBushInstances: TreeInstanceData[] = [];
-      const chunkMushroomInstances: TreeInstanceData[] = [];
-
-      for (let r = 0; r < rows; r++) {
-        for (let c = 0; c < cols; c++) {
-          const posX = c - centerX;
-          const posZ = r - centerZ;
-
-          if (posX < chunk.minX || posX >= chunk.maxX || posZ < chunk.minZ || posZ >= chunk.maxZ) {
-            continue;
-          }
-
-          const idx = tileEngine.getIndex(r, c);
-          const blockTypeIdx = tileEngine.blockTypeIds[idx];
-          if (blockTypeIdx === 255) continue;
-
-          const cell = worldGrid[r][c];
-          if (!cell) continue;
-
-          const isTree = cell.type === 'tree_oak' || cell.type === 'tree_pine' || cell.type === 'bush';
-          const isMushroom = cell.type === 'mushroom';
-
-          if (isTree || isMushroom) {
-            // Meadow grass underneath 3D model
-            const grassSpriteIdx = cell.spriteIndex ?? SPRITE_DEFS.grass.spriteIndex;
-            const grassKey = `${grassSpriteIdx}_0.10`;
-            if (!groups.has(grassKey)) {
-              groups.set(grassKey, { spriteIndex: grassSpriteIdx, height: 0.1, positions: [] });
-            }
-            groups.get(grassKey)!.positions.push({ x: posX, y: 0.1 / 2 - 0.5, z: posZ });
-
-            const seedVal = r * 31 + c * 17;
-            const pseudoRng = Math.abs(Math.sin(seedVal));
-            const rotY = pseudoRng * Math.PI * 2;
-            const scaleVar = 0.85 + (pseudoRng % 0.3);
-            const modelY = -0.45;
-
-            if (cell.type === 'tree_oak') {
-              chunkOakInstances.push({ x: posX, y: modelY, z: posZ, rotY, scaleX: scaleVar, scaleY: scaleVar, scaleZ: scaleVar });
-            } else if (cell.type === 'tree_pine') {
-              chunkPineInstances.push({ x: posX, y: modelY, z: posZ, rotY, scaleX: scaleVar, scaleY: scaleVar * 1.15, scaleZ: scaleVar });
-            } else if (cell.type === 'bush') {
-              chunkBushInstances.push({ x: posX, y: modelY, z: posZ, rotY, scaleX: scaleVar, scaleY: scaleVar, scaleZ: scaleVar });
-            } else if (cell.type === 'mushroom') {
-              chunkMushroomInstances.push({ x: posX, y: modelY, z: posZ, rotY, scaleX: scaleVar, scaleY: scaleVar, scaleZ: scaleVar });
-            }
-            continue;
-          }
-
-          if (cell.type.startsWith('mountain') || cell.type === 'rock') {
-            continue; // Handled by unified mountain mesh
-          }
-
-          const spriteIndex = tileEngine.spriteIndices[idx];
-          const height = tileEngine.heights[idx];
-          const groupKey = `${spriteIndex}_${height.toFixed(2)}`;
-
-          if (!groups.has(groupKey)) {
-            groups.set(groupKey, { spriteIndex, height, positions: [] });
-          }
-
-          const posY = height / 2 - 0.5;
-          groups.get(groupKey)!.positions.push({ x: posX, y: posY, z: posZ });
-        }
+      for (let i = 0; i < terrainInstances.length; i++) {
+        const instance = terrainInstances[i];
+        _tempVec3_1.set(instance.x, instance.y, instance.z);
+        _tempVec3_2.set(1, instance.height, 1);
+        _tempMat4_1.compose(_tempVec3_1, _tempQuat_1, _tempVec3_2);
+        terrainMesh.setMatrixAt(i, _tempMat4_1);
+        spriteIndices[i] = instance.spriteIndex;
       }
 
-      // Instantiate chunk terrain InstancedMeshes
-      groups.forEach((group) => {
-        const count = group.positions.length;
-        if (count === 0) return;
+      terrainGeometry.setAttribute(
+        'instanceSpriteIndex',
+        new THREE.InstancedBufferAttribute(spriteIndices, 1).setUsage(THREE.StaticDrawUsage)
+      );
+      terrainMesh.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+      terrainMesh.instanceMatrix.needsUpdate = true;
+      terrainMesh.name = 'BatchedTerrain';
+      this.worldGroup.add(terrainMesh);
+    }
 
-        const geo = this.poolManager.getBlockGeometry(1.0, group.height, 1.0, group.spriteIndex);
-        const instancedMesh = this.poolManager.acquireInstancedMesh(geo, materials, count);
+    chunks.forEach((chunk, chunkIndex) => {
+      const treeInstances = treeInstancesByChunk[chunkIndex];
 
-        for (let i = 0; i < count; i++) {
-          const pos = group.positions[i];
-          _tempMat4_1.makeTranslation(pos.x, pos.y, pos.z);
-          instancedMesh.setMatrixAt(i, _tempMat4_1);
-        }
-
-        instancedMesh.instanceMatrix.needsUpdate = true;
-        chunk.group.add(instancedMesh);
-      });
-
-      // Render 3D Low-Poly Trees per chunk with GPU InstancedMeshes (enables frustum culling per chunk)
+      // Render low-poly trees per chunk so alpha-tested geometry and shadows cull together.
       const renderChunkTrees = (type: 'oak' | 'pine' | 'bush' | 'mushroom', instances: TreeInstanceData[]) => {
         if (instances.length === 0) return;
 
@@ -400,10 +424,10 @@ export class TileRenderer {
         chunk.group.add(mesh);
       };
 
-      renderChunkTrees('oak', chunkOakInstances);
-      renderChunkTrees('pine', chunkPineInstances);
-      renderChunkTrees('bush', chunkBushInstances);
-      renderChunkTrees('mushroom', chunkMushroomInstances);
+      renderChunkTrees('oak', treeInstances.oak);
+      renderChunkTrees('pine', treeInstances.pine);
+      renderChunkTrees('bush', treeInstances.bush);
+      renderChunkTrees('mushroom', treeInstances.mushroom);
     });
 
     // 3. Render Unified Mountain Mesh Group
@@ -411,6 +435,9 @@ export class TileRenderer {
     this.worldGroup.add(unifiedMountainGroup);
 
     this.lightEmitters = tileEngine.emitters;
+    this.lastTargetX = NaN;
+    this.lastTargetZ = NaN;
+    this.dirLight.shadow.needsUpdate = true;
 
     // Populate tileHeights & pre-allocate lightTintMesh tile matrices
     this.tileHeights.fill(0);
@@ -625,14 +652,13 @@ export class TileRenderer {
     if (this.lightType === 'fake') {
       this.fakeLightGroup.visible = true;
 
-      // Override / bypass real-time WebGL lights; ambient light is OFF in fake mode
-      if (this.dirLight) this.dirLight.intensity = 0;
-      if (this.fillLight) this.fillLight.intensity = 0;
-      if (this.orbLight) this.orbLight.intensity = 0;
-      if (this.centerLight) this.centerLight.intensity = 0;
-      if (this.ambientLight) {
-        this.ambientLight.intensity = 0;
-      }
+      // Remove lights from the render list entirely. Intensity zero still leaves
+      // them in Three.js' forward-light shader permutation.
+      this.dirLight.visible = false;
+      this.fillLight.visible = false;
+      this.orbLight.visible = false;
+      this.centerLight.visible = false;
+      this.ambientLight.visible = false;
 
       for (let i = 0; i < this.lightPool.length; i++) {
         this.lightPool[i].visible = false;
@@ -644,7 +670,12 @@ export class TileRenderer {
     } else {
       // REAL-TIME LIGHTING MODE
       this.fakeLightGroup.visible = false;
-      this.lastLightType = 'realtime';
+      const enteringRealtime = this.lastLightType !== 'realtime';
+      this.dirLight.visible = true;
+      this.fillLight.visible = true;
+      this.orbLight.visible = true;
+      this.centerLight.visible = true;
+      this.ambientLight.visible = true;
 
       // Smooth Day/Night Celestial Sun Position
       const targetMins = dayNightState.isTimeLocked
@@ -680,6 +711,20 @@ export class TileRenderer {
           this.dirLight.color.set('#60a5fa');
           this.dirLight.intensity = 0.45;
         }
+
+        const shadowDx = this.dirLight.position.x - this.lastShadowSunX;
+        const shadowDy = this.dirLight.position.y - this.lastShadowSunY;
+        const shadowDz = this.dirLight.position.z - this.lastShadowSunZ;
+        if (
+          enteringRealtime ||
+          !Number.isFinite(this.lastShadowSunX) ||
+          shadowDx * shadowDx + shadowDy * shadowDy + shadowDz * shadowDz > 4
+        ) {
+          this.lastShadowSunX = this.dirLight.position.x;
+          this.lastShadowSunY = this.dirLight.position.y;
+          this.lastShadowSunZ = this.dirLight.position.z;
+          this.dirLight.shadow.needsUpdate = true;
+        }
       }
 
       if (this.fillLight) {
@@ -700,15 +745,26 @@ export class TileRenderer {
       if (this.controls && this.lightEmitters.length > 0) {
         const fx = this.controls.target.x;
         const fz = this.controls.target.z;
+        const targetDx = fx - this.lastTargetX;
+        const targetDz = fz - this.lastTargetZ;
+        const lightSelectionDirty =
+          enteringRealtime ||
+          !Number.isFinite(this.lastTargetX) ||
+          targetDx * targetDx + targetDz * targetDz > 0.25;
 
-        for (let i = 0; i < this.lightEmitters.length; i++) {
-          const e = this.lightEmitters[i];
-          const dx = e.x - fx;
-          const dz = e.z - fz;
-          e.distSq = dx * dx + dz * dz;
+        if (lightSelectionDirty) {
+          this.lastTargetX = fx;
+          this.lastTargetZ = fz;
+
+          for (let i = 0; i < this.lightEmitters.length; i++) {
+            const e = this.lightEmitters[i];
+            const dx = e.x - fx;
+            const dz = e.z - fz;
+            e.distSq = dx * dx + dz * dz;
+          }
+
+          this.lightEmitters.sort((a, b) => (a.distSq || 0) - (b.distSq || 0));
         }
-
-        this.lightEmitters.sort((a, b) => (a.distSq || 0) - (b.distSq || 0));
 
         const nightFactor = sunY < 0 ? 2.2 : 1.0;
 
@@ -736,18 +792,16 @@ export class TileRenderer {
       if (this.centerLight) {
         this.centerLight.intensity = sunY >= 0 ? 0.2 * sunY : 0;
       }
+
+      this.lastSunY = sunY;
+      this.lastLightType = 'realtime';
     }
 
     // 6. Update Controls FIRST to update camera transform
     this.controls.update();
 
     // 7. Force current frame matrices update for camera and world
-    if (this.activeCamera) {
-      this.activeCamera.updateMatrixWorld(true);
-    }
-    if (this.worldGroup) {
-      this.worldGroup.updateMatrixWorld(true);
-    }
+    if (this.activeCamera) this.activeCamera.updateMatrixWorld();
 
     // 8. Frustum Culling using FRESH current-frame matrices
     this.frustumCuller.updateVisibility(this.activeCamera);
@@ -814,7 +868,9 @@ export class TileRenderer {
   }
 
   public dispose(): void {
+    this.controls.dispose();
     this.poolManager.disposeAll();
     this.renderer.dispose();
+    this.renderer.domElement.remove();
   }
 }

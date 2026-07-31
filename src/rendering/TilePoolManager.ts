@@ -30,33 +30,43 @@ export class TilePoolManager {
   }
 
   /**
-   * Get or create a cached BoxGeometry with top face UVs mapped to spriteIndex in 16x16 atlas
+   * Unit block used by the GPU-driven terrain batch.
+   *
+   * BoxGeometry normally has six material groups, which means six draw calls even
+   * when five faces share one material. Reordering the index buffer lets all five
+   * side/bottom faces render in one call and the atlas-mapped top render in a second.
+   * Per-instance matrices provide height and per-instance attributes select sprites.
    */
-  public getBlockGeometry(width: number, height: number, depth: number, spriteIndex: number): THREE.BoxGeometry {
-    const key = `box_${width.toFixed(2)}_${height.toFixed(2)}_${depth.toFixed(2)}_${spriteIndex}`;
+  public getBatchedBlockGeometry(): THREE.BoxGeometry {
+    const key = 'batched_block_unit_v1';
     if (this.geometryCache.has(key)) {
       return this.geometryCache.get(key) as THREE.BoxGeometry;
     }
 
-    const geo = new THREE.BoxGeometry(width, height, depth);
-    const uvs = geo.attributes.uv.array as Float32Array;
+    const geo = new THREE.BoxGeometry(1, 1, 1);
+    const sourceIndex = geo.index;
+    if (!sourceIndex) {
+      throw new Error('Batched block geometry requires indexed BoxGeometry');
+    }
 
-    const col = spriteIndex % 16;
-    const row = Math.floor(spriteIndex / 16);
+    const original = Array.from(sourceIndex.array);
+    const sideIndices: number[] = [];
+    const topIndices: number[] = [];
 
-    const eps = 0.0001; // Avoid subpixel boundary bleeding in NearestFilter
-    const u0 = col / 16 + eps;
-    const u1 = (col + 1) / 16 - eps;
-    const v0 = 1 - (row + 1) / 16 + eps;
-    const v1 = 1 - row / 16 - eps;
+    for (const group of geo.groups) {
+      const target = group.materialIndex === 2 ? topIndices : sideIndices;
+      for (let i = group.start; i < group.start + group.count; i++) {
+        target.push(original[i]);
+      }
+    }
 
-    // Face 2 (+Y top face) UVs: indices 16..23
-    uvs[16] = u0; uvs[17] = v1;
-    uvs[18] = u1; uvs[19] = v1;
-    uvs[20] = u0; uvs[21] = v0;
-    uvs[22] = u1; uvs[23] = v0;
+    geo.setIndex([...sideIndices, ...topIndices]);
+    geo.clearGroups();
+    geo.addGroup(0, sideIndices.length, 0);
+    geo.addGroup(sideIndices.length, topIndices.length, 1);
+    geo.computeBoundingBox();
+    geo.computeBoundingSphere();
 
-    geo.attributes.uv.needsUpdate = true;
     this.geometryCache.set(key, geo);
     return geo;
   }
@@ -95,6 +105,41 @@ export class TilePoolManager {
       roughness: 0.85,
       metalness: 0.1,
     });
+
+    // Select the 16x16 atlas cell in the shader from an InstancedBufferAttribute.
+    // This is the key that allows every terrain sprite and height to share one mesh.
+    mat.onBeforeCompile = (shader) => {
+      shader.vertexShader = shader.vertexShader
+        .replace(
+          '#include <common>',
+          '#include <common>\nattribute float instanceSpriteIndex;\nvarying float vInstanceSpriteIndex;'
+        )
+        .replace(
+          '#include <begin_vertex>',
+          '#include <begin_vertex>\nvInstanceSpriteIndex = instanceSpriteIndex;'
+        );
+
+      shader.fragmentShader = shader.fragmentShader
+        .replace(
+          '#include <common>',
+          '#include <common>\nvarying float vInstanceSpriteIndex;'
+        )
+        .replace(
+          '#include <map_fragment>',
+          `#ifdef USE_MAP
+            float atlasIndex = floor(vInstanceSpriteIndex + 0.5);
+            float atlasColumn = mod(atlasIndex, 16.0);
+            float atlasRow = floor(atlasIndex / 16.0);
+            vec2 atlasUv = vec2(
+              (atlasColumn + clamp(vMapUv.x, 0.0016, 0.9984)) / 16.0,
+              (15.0 - atlasRow + clamp(vMapUv.y, 0.0016, 0.9984)) / 16.0
+            );
+            vec4 sampledDiffuseColor = texture2D(map, atlasUv);
+            diffuseColor *= sampledDiffuseColor;
+          #endif`
+        );
+    };
+    mat.customProgramCacheKey = () => 'instanced-atlas-v1';
 
     this.materialCache.set(key, mat);
     return mat;
