@@ -694,9 +694,11 @@ export class TileRenderer {
       const sunY = Math.sin(sunAngle);
       const sunX = Math.cos(sunAngle) * 110;
       const sunZ = Math.cos(sunAngle * 0.5) * 40;
+      const isDaylight = sunY > 0;
 
       if (this.dirLight) {
-        if (sunY > 0) {
+        if (isDaylight) {
+          this.dirLight.visible = true;
           this.dirLight.position.set(sunX, Math.max(8, sunY * 110), sunZ);
           const dayProgress = Math.max(0, sunY);
           if (dayProgress < 0.25) {
@@ -707,9 +709,9 @@ export class TileRenderer {
             this.dirLight.intensity = 1.0 + dayProgress * 1.4;
           }
         } else {
-          this.dirLight.position.set(-sunX, Math.max(8, -sunY * 80), -sunZ);
-          this.dirLight.color.set('#60a5fa');
-          this.dirLight.intensity = 0.45;
+          // Full night is unlit except for actual point-light emitters.
+          this.dirLight.visible = false;
+          this.dirLight.intensity = 0;
         }
 
         const shadowDx = this.dirLight.position.x - this.lastShadowSunX;
@@ -728,16 +730,17 @@ export class TileRenderer {
       }
 
       if (this.fillLight) {
-        this.fillLight.intensity = sunY > 0 ? sunY * 0.8 : 0.2;
+        this.fillLight.visible = isDaylight;
+        this.fillLight.intensity = isDaylight ? sunY * 0.8 : 0;
       }
 
       if (this.ambientLight) {
-        if (sunY > 0) {
+        if (isDaylight) {
+          this.ambientLight.visible = true;
           this.ambientLight.color.set('#3b4252');
           this.ambientLight.intensity = sunY * 1.8;
         } else {
-          this.ambientLight.color.set('#1e293b');
-          this.ambientLight.intensity = 0.5;
+          this.ambientLight.intensity = 0;
         }
       }
 
