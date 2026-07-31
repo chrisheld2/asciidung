@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { ColorTheme, WorldCell, MazeStats, CameraPreset, SpritePackType, RenderMetrics, DayNightState, LightType } from '../types';
 import { TileDataEngine } from '../rendering/TileData';
@@ -21,6 +21,7 @@ interface ASCIIMazeCanvasProps {
 }
 
 const CAMERA_STORAGE_KEY = 'spritedung_camera_position_v3';
+const CAMERA_SAVE_INTERVAL_MS = 3000;
 
 interface SavedCameraState {
   perspPos: { x: number; y: number; z: number };
@@ -42,26 +43,11 @@ const isValidCameraState = (state: SavedCameraState | null): state is SavedCamer
 
   if (!validTarget || !validPersp || !validOrtho || !validZoom) return false;
 
-  // Target must be within reasonable world bounds so camera is never lost
-  if (Math.abs(target.x) > 80 || Math.abs(target.z) > 80 || Math.abs(target.y) > 40) return false;
-
-  const pdx = perspPos.x - target.x;
-  const pdy = perspPos.y - target.y;
-  const pdz = perspPos.z - target.z;
-  const pDistSq = pdx * pdx + pdy * pdy + pdz * pdz;
-
-  const odx = orthoPos.x - target.x;
-  const ody = orthoPos.y - target.y;
-  const odz = orthoPos.z - target.z;
-  const oDistSq = odx * odx + ody * ody + odz * odz;
-
-  if (pDistSq < 1 || pDistSq > 30000 || oDistSq < 1 || oDistSq > 30000) return false;
-
   return true;
 };
 
-const saveCameraStateImmediate = (tileRenderer: TileRenderer | null, isOrthographic: boolean) => {
-  if (!tileRenderer || !tileRenderer.controls || !tileRenderer.perspCamera || !tileRenderer.orthoCamera) return;
+const saveCameraStateImmediate = (tileRenderer: TileRenderer | null, isOrthographic: boolean): boolean => {
+  if (!tileRenderer || !tileRenderer.controls || !tileRenderer.perspCamera || !tileRenderer.orthoCamera) return false;
 
   const persp = tileRenderer.perspCamera;
   const ortho = tileRenderer.orthoCamera;
@@ -78,20 +64,28 @@ const saveCameraStateImmediate = (tileRenderer: TileRenderer | null, isOrthograp
   if (isValidCameraState(state)) {
     try {
       localStorage.setItem(CAMERA_STORAGE_KEY, JSON.stringify(state));
+      return true;
     } catch {
       // Ignore storage errors
     }
   }
+  return false;
 };
 
 let saveTimer: number | null = null;
-const scheduleSaveCameraState = (tileRenderer: TileRenderer | null, isOrthographic: boolean) => {
+const scheduleSaveCameraState = (
+  tileRenderer: TileRenderer | null,
+  isOrthographic: boolean,
+  onSaved?: () => void
+) => {
   if (saveTimer !== null) {
-    window.clearTimeout(saveTimer);
+  window.clearTimeout(saveTimer);
   }
   saveTimer = window.setTimeout(() => {
     saveTimer = null;
-    saveCameraStateImmediate(tileRenderer, isOrthographic);
+    if (saveCameraStateImmediate(tileRenderer, isOrthographic)) {
+      onSaved?.();
+    }
   }, 100);
 };
 
@@ -208,6 +202,8 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
   const containerRef = useRef<HTMLDivElement>(null);
   const rendererInstanceRef = useRef<TileRenderer | null>(null);
   const tileEngineRef = useRef<TileDataEngine>(new TileDataEngine(64, 64));
+  const [isCameraSaveToastVisible, setIsCameraSaveToastVisible] = useState(false);
+  const cameraSaveToastTimerRef = useRef<number | null>(null);
 
   const isOrthographicRef = useRef(isOrthographic);
   useEffect(() => {
@@ -246,6 +242,17 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
   const isInitialPresetRef = useRef(true);
   const prevCenterTriggerRef = useRef(centerCameraTrigger);
   const pressedKeysRef = useRef<Set<string>>(new Set());
+
+  const showCameraSaveToast = () => {
+    setIsCameraSaveToastVisible(true);
+    if (cameraSaveToastTimerRef.current !== null) {
+      window.clearTimeout(cameraSaveToastTimerRef.current);
+    }
+    cameraSaveToastTimerRef.current = window.setTimeout(() => {
+      setIsCameraSaveToastVisible(false);
+      cameraSaveToastTimerRef.current = null;
+    }, 1800);
+  };
 
   // Listen for WASD / Arrow keys for panning camera along X and Y axes
   useEffect(() => {
@@ -295,13 +302,21 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
   useEffect(() => {
     if (!containerRef.current) return;
 
+    // A new renderer needs its own restore pass. This is especially important
+    // in React Strict Mode, which deliberately mounts, cleans up, and mounts
+    // effects again during development.
+    hasInitializedCameraRef.current = false;
+    // The camera-preset effect must also skip once for each renderer. Otherwise
+    // Strict Mode's second effect pass restores the saved camera, then immediately
+    // overwrites it with the default preset.
+    isInitialPresetRef.current = true;
     const tileRenderer = new TileRenderer(containerRef.current, isOrthographic, theme);
     tileRenderer.lightType = lightTypeRef.current;
     rendererInstanceRef.current = tileRenderer;
 
     const handleControlsChange = () => {
       if (hasInitializedCameraRef.current) {
-        scheduleSaveCameraState(tileRenderer, isOrthographicRef.current);
+        scheduleSaveCameraState(tileRenderer, isOrthographicRef.current, showCameraSaveToast);
       }
     };
     tileRenderer.controls.addEventListener('change', handleControlsChange);
@@ -314,6 +329,15 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
         saveCameraStateImmediate(tileRenderer, isOrthographicRef.current);
       }
     };
+    // Keep a durable checkpoint even when the camera changes without an
+    // OrbitControls change event (for example while auto-rotation is active).
+    const cameraSaveInterval = window.setInterval(() => {
+      if (hasInitializedCameraRef.current) {
+        if (saveCameraStateImmediate(tileRenderer, isOrthographicRef.current)) {
+          showCameraSaveToast();
+        }
+      }
+    }, CAMERA_SAVE_INTERVAL_MS);
     window.addEventListener('beforeunload', handleUnload);
     window.addEventListener('pagehide', handleUnload);
     document.addEventListener('visibilitychange', handleVisibilityChange);
@@ -384,6 +408,10 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
 
     return () => {
       saveCameraStateImmediate(tileRenderer, isOrthographicRef.current);
+      window.clearInterval(cameraSaveInterval);
+      if (cameraSaveToastTimerRef.current !== null) {
+        window.clearTimeout(cameraSaveToastTimerRef.current);
+      }
       window.removeEventListener('beforeunload', handleUnload);
       window.removeEventListener('pagehide', handleUnload);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
@@ -513,9 +541,19 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
   }, [centerCameraTrigger, cameraPreset]);
 
   return (
-    <div
-      ref={containerRef}
-      className="absolute inset-0 w-full h-full overflow-hidden bg-black"
-    />
+    <>
+      <div
+        ref={containerRef}
+        className="absolute inset-0 w-full h-full overflow-hidden bg-black"
+      />
+      {isCameraSaveToastVisible && (
+        <div
+          role="status"
+          className="pointer-events-none fixed right-4 bottom-4 z-50 rounded border border-emerald-400/70 bg-zinc-950/90 px-3 py-2 font-mono text-xs text-emerald-300 shadow-lg backdrop-blur"
+        >
+          Camera state saved
+        </div>
+      )}
+    </>
   );
 };

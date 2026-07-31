@@ -16,6 +16,9 @@ const _tempQuat_1 = new THREE.Quaternion();
 const _tempEuler_1 = new THREE.Euler();
 const _tempColor_1 = new THREE.Color();
 const _tempColor_2 = new THREE.Color();
+const _lightFrustum = new THREE.Frustum();
+const _lightProjScreenMatrix = new THREE.Matrix4();
+const _lightInfluenceSphere = new THREE.Sphere();
 
 const _rightVec = new THREE.Vector3();
 const _upVec = new THREE.Vector3();
@@ -644,6 +647,16 @@ export class TileRenderer {
       this.worldGroup.rotation.y = 0;
     }
 
+    // OrbitControls can move/rotate the camera independently of its target. Update
+    // its transform before choosing pooled lights so culling uses this frame's view.
+    this.controls.update();
+    this.activeCamera.updateMatrixWorld();
+    _lightProjScreenMatrix.multiplyMatrices(
+      this.activeCamera.projectionMatrix,
+      this.activeCamera.matrixWorldInverse
+    );
+    _lightFrustum.setFromProjectionMatrix(_lightProjScreenMatrix);
+
     // 3. Lighting Pipeline Update (Real-Time vs Fake Light)
     const orbX = Math.cos(this.time * 0.6) * 26.88;
     const orbZ = Math.sin(this.time * 0.6) * 26.88;
@@ -744,7 +757,10 @@ export class TileRenderer {
         }
       }
 
-      // Point Light Pooling (Closest pooled lights)
+      // Point Light Pooling: retain emitters while any part of their illumination
+      // radius intersects the current camera frustum. Testing only the source
+      // point turns a light off too early when it is just beyond the frame edge
+      // but still lights visible tiles.
       if (this.controls && this.lightEmitters.length > 0) {
         const fx = this.controls.target.x;
         const fz = this.controls.target.z;
@@ -771,18 +787,29 @@ export class TileRenderer {
 
         const nightFactor = sunY < 0 ? 2.2 : 1.0;
 
-        for (let i = 0; i < this.lightPool.length; i++) {
-          const pl = this.lightPool[i];
-          if (i < this.lightEmitters.length && (this.lightEmitters[i].distSq || 0) < 4000) {
-            const e = this.lightEmitters[i];
+        let poolIndex = 0;
+        for (let i = 0; i < this.lightEmitters.length && poolIndex < this.lightPool.length; i++) {
+          const e = this.lightEmitters[i];
+          const effectiveDistance = e.distance * (sunY < 0 ? 1.2 : 1.0);
+          _lightInfluenceSphere.center.set(e.x, e.y, e.z);
+          _lightInfluenceSphere.radius = effectiveDistance;
+          if (_lightFrustum.intersectsSphere(_lightInfluenceSphere)) {
+            const pl = this.lightPool[poolIndex++];
             pl.position.set(e.x, e.y, e.z);
             pl.color.set(e.color);
             pl.intensity = e.intensity * nightFactor;
-            pl.distance = e.distance * (sunY < 0 ? 1.2 : 1.0);
+            pl.distance = effectiveDistance;
             pl.visible = true;
-          } else {
-            pl.visible = false;
           }
+        }
+
+        // Any unused pooled light must be removed from Three.js' render list.
+        for (let i = poolIndex; i < this.lightPool.length; i++) {
+          this.lightPool[i].visible = false;
+        }
+      } else {
+        for (let i = 0; i < this.lightPool.length; i++) {
+          this.lightPool[i].visible = false;
         }
       }
 
@@ -800,16 +827,13 @@ export class TileRenderer {
       this.lastLightType = 'realtime';
     }
 
-    // 6. Update Controls FIRST to update camera transform
-    this.controls.update();
-
-    // 7. Force current frame matrices update for camera and world
+    // 6. Force current frame matrices update for camera and world
     if (this.activeCamera) this.activeCamera.updateMatrixWorld();
 
-    // 8. Frustum Culling using FRESH current-frame matrices
+    // 7. Frustum Culling using FRESH current-frame matrices
     this.frustumCuller.updateVisibility(this.activeCamera);
 
-    // 9. Render Scene
+    // 8. Render Scene
     this.renderer.render(this.scene, this.activeCamera);
   }
 
