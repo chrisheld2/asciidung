@@ -16,6 +16,10 @@ export class TilePoolManager {
   // Shared material cache
   private materialCache = new Map<string, THREE.Material>();
 
+  // Shared shader clock. Water animation is performed in the existing terrain
+  // batch, so it adds no meshes or draw calls.
+  private waterTimeUniform = { value: 0 };
+
   // Shared InstancedMesh pool
   private instancedMeshPool: THREE.InstancedMesh[] = [];
 
@@ -109,6 +113,7 @@ export class TilePoolManager {
     // Select the 16x16 atlas cell in the shader from an InstancedBufferAttribute.
     // This is the key that allows every terrain sprite and height to share one mesh.
     mat.onBeforeCompile = (shader) => {
+      shader.uniforms.waterTime = this.waterTimeUniform;
       shader.vertexShader = shader.vertexShader
         .replace(
           '#include <common>',
@@ -122,7 +127,7 @@ export class TilePoolManager {
       shader.fragmentShader = shader.fragmentShader
         .replace(
           '#include <common>',
-          '#include <common>\nvarying float vInstanceSpriteIndex;'
+          '#include <common>\nvarying float vInstanceSpriteIndex;\nuniform float waterTime;'
         )
         .replace(
           '#include <map_fragment>',
@@ -130,19 +135,41 @@ export class TilePoolManager {
             float atlasIndex = floor(vInstanceSpriteIndex + 0.5);
             float atlasColumn = mod(atlasIndex, 16.0);
             float atlasRow = floor(atlasIndex / 16.0);
+            vec2 localUv = clamp(vMapUv, 0.0016, 0.9984);
+            float isWater = step(7.5, atlasIndex) * (1.0 - step(9.5, atlasIndex));
+
+            // Animate in whole texels and whole frames. The staggered rows make
+            // little wavelets while preserving the deliberately chunky 8x8 look.
+            float waterFrame = floor(waterTime * 4.0);
+            vec2 waterPixel = floor(localUv * 8.0);
+            float rowStagger = floor(waterPixel.y * 0.5);
+            waterPixel.x = mod(waterPixel.x + waterFrame + rowStagger, 8.0);
+            waterPixel.y = mod(waterPixel.y + floor(waterFrame * 0.25), 8.0);
+            vec2 animatedUv = (waterPixel + 0.5) / 8.0;
+            localUv = mix(localUv, animatedUv, isWater);
+
             vec2 atlasUv = vec2(
-              (atlasColumn + clamp(vMapUv.x, 0.0016, 0.9984)) / 16.0,
-              (15.0 - atlasRow + clamp(vMapUv.y, 0.0016, 0.9984)) / 16.0
+              (atlasColumn + localUv.x) / 16.0,
+              (15.0 - atlasRow + localUv.y) / 16.0
             );
             vec4 sampledDiffuseColor = texture2D(map, atlasUv);
+
+            // Sparse, frame-stepped glints give the water a little extra pop.
+            float glintPattern = mod(waterPixel.x + waterPixel.y * 3.0 + floor(waterFrame * 0.5), 11.0);
+            float glint = isWater * (1.0 - step(0.5, glintPattern));
+            sampledDiffuseColor.rgb = mix(sampledDiffuseColor.rgb, min(vec3(1.0), sampledDiffuseColor.rgb * 1.3 + vec3(0.02, 0.08, 0.12)), glint * 0.75);
             diffuseColor *= sampledDiffuseColor;
           #endif`
         );
     };
-    mat.customProgramCacheKey = () => 'instanced-atlas-v1';
+    mat.customProgramCacheKey = () => 'instanced-atlas-water-v2';
 
     this.materialCache.set(key, mat);
     return mat;
+  }
+
+  public updateWaterAnimation(time: number): void {
+    this.waterTimeUniform.value = time;
   }
 
   /**

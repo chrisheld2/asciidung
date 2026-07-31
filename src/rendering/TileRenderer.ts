@@ -19,6 +19,9 @@ const _tempColor_2 = new THREE.Color();
 const _lightFrustum = new THREE.Frustum();
 const _lightProjScreenMatrix = new THREE.Matrix4();
 const _lightInfluenceSphere = new THREE.Sphere();
+const _mouseNdc = new THREE.Vector2();
+const _mouseRaycaster = new THREE.Raycaster();
+const _mouseLightHit = new THREE.Vector3();
 
 const _rightVec = new THREE.Vector3();
 const _upVec = new THREE.Vector3();
@@ -58,14 +61,17 @@ export class TileRenderer {
 
   public worldGroup: THREE.Group;
   public floorMesh: THREE.Mesh | null = null;
+  private adventurerTexture: THREE.Texture;
 
   // Lights
   public ambientLight: THREE.AmbientLight;
   public dirLight: THREE.DirectionalLight;
   public fillLight: THREE.DirectionalLight;
   public centerLight: THREE.PointLight;
-  public orbLight: THREE.PointLight;
+  public mouseLight: THREE.PointLight;
   public lightPool: THREE.PointLight[] = [];
+  private pooledEmitters: Array<LightEmitter | null> = [];
+  private mouseLightActive = false;
 
   // Managers
   public poolManager: TilePoolManager;
@@ -189,11 +195,18 @@ export class TileRenderer {
     this.centerLight = new THREE.PointLight(theme.light, 3.5, 80);
     this.scene.add(this.centerLight);
 
-    this.orbLight = new THREE.PointLight(0x38bdf8, 2.0, 40);
-    this.scene.add(this.orbLight);
 
-    // Forward rendering pays the point-light cost in every lit fragment. A strict
-    // nearest-six budget is a predictable console/desktop-quality performance tier.
+    // A dedicated, non-shadow-casting light follows the cursor's raycast hit.
+    // It stays outside the emitter pool so moving the pointer never reshuffles
+    // gameplay lights.
+    this.mouseLight = new THREE.PointLight(0xfff1c1, 4.5, 18, 2);
+    this.mouseLight.castShadow = false;
+    this.mouseLight.visible = false;
+    this.scene.add(this.mouseLight);
+
+    // Forward rendering pays the point-light cost in every lit fragment. Keep a
+    // strict six-light budget, and preserve each assignment until its influence
+    // has actually left the camera view.
     const MAX_POOLED_LIGHTS = 6;
     for (let i = 0; i < MAX_POOLED_LIGHTS; i++) {
       const pl = new THREE.PointLight(0xffaa44, 0, 16);
@@ -201,11 +214,17 @@ export class TileRenderer {
       pl.visible = false;
       this.scene.add(pl);
       this.lightPool.push(pl);
+      this.pooledEmitters.push(null);
     }
 
     // 6. World Root Container
     this.worldGroup = new THREE.Group();
     this.scene.add(this.worldGroup);
+
+    // The player is a camera-facing 2D billboard, kept as a texture so it can
+    // sit naturally among the 3D dungeon blocks.
+    this.adventurerTexture = new THREE.TextureLoader().load('/assets/sprites/adventurer-2d.png');
+    this.adventurerTexture.colorSpace = THREE.SRGBColorSpace;
 
     // 7. Fake Light Mode Visual Objects (Glowing Light Sources & Distance Light Tint)
     const sourceGeo = new THREE.OctahedronGeometry(0.35, 1);
@@ -236,6 +255,47 @@ export class TileRenderer {
   }
 
   /**
+   * Cast the screen-space pointer through the active camera and place the
+   * cursor light just above the first piece of world geometry it hits.
+   */
+  public updateMouseLightFromPointer(clientX: number, clientY: number): void {
+    const bounds = this.renderer.domElement.getBoundingClientRect();
+    if (bounds.width <= 0 || bounds.height <= 0) return;
+
+    _mouseNdc.set(
+      ((clientX - bounds.left) / bounds.width) * 2 - 1,
+      -((clientY - bounds.top) / bounds.height) * 2 + 1
+    );
+
+    this.activeCamera.updateMatrixWorld(true);
+    this.worldGroup.updateMatrixWorld(true);
+    this.floorMesh?.updateMatrixWorld(true);
+    _mouseRaycaster.setFromCamera(_mouseNdc, this.activeCamera);
+
+    const targets: THREE.Object3D[] = this.floorMesh
+      ? [this.worldGroup, this.floorMesh]
+      : [this.worldGroup];
+    const hit = _mouseRaycaster.intersectObjects(targets, true)[0];
+
+    if (!hit) {
+      this.mouseLightActive = false;
+      this.mouseLight.visible = false;
+      return;
+    }
+
+    _mouseLightHit.copy(hit.point);
+    _mouseLightHit.y += 1.25;
+    this.mouseLight.position.copy(_mouseLightHit);
+    this.mouseLightActive = true;
+    this.mouseLight.visible = this.lightType === 'realtime';
+  }
+
+  public hideMouseLight(): void {
+    this.mouseLightActive = false;
+    this.mouseLight.visible = false;
+  }
+
+  /**
    * Rebuild whole 64x64 scene with InstancedMesh groups & GPU offloading
    */
   public buildWorld(
@@ -262,6 +322,8 @@ export class TileRenderer {
                 obj.material.dispose();
               }
             }
+          } else if (obj instanceof THREE.Sprite && obj.material) {
+            obj.material.dispose();
           }
         });
         child.clear();
@@ -437,6 +499,46 @@ export class TileRenderer {
     const unifiedMountainGroup = buildUnifiedMountainMeshGroup(worldGrid, spritePack);
     this.worldGroup.add(unifiedMountainGroup);
 
+    // Place the adventurer at the dungeon centre. If the exact centre is
+    // occupied by terrain, walk outward to the nearest walkable cell so the
+    // billboard remains visible and grounded on the dungeon floor.
+    let playerX = 0;
+    let playerZ = 0;
+    let playerHeight = 0;
+    const centreRow = Math.floor(rows / 2);
+    const centreCol = Math.floor(cols / 2);
+    for (let radius = 0; radius < Math.max(rows, cols); radius++) {
+      let found = false;
+      for (let dr = -radius; dr <= radius && !found; dr++) {
+        for (let dc = -radius; dc <= radius && !found; dc++) {
+          if (Math.max(Math.abs(dr), Math.abs(dc)) !== radius) continue;
+          const row = centreRow + dr;
+          const col = centreCol + dc;
+          const cell = worldGrid[row]?.[col];
+          if (!cell || cell.type.startsWith('mountain') || cell.type === 'rock' || cell.type.startsWith('tree_') || cell.type === 'bush') continue;
+          playerX = col - centerX;
+          playerZ = row - centerZ;
+          playerHeight = cell.height || 0;
+          found = true;
+        }
+      }
+      if (found) break;
+    }
+
+    const adventurerMaterial = new THREE.SpriteMaterial({
+      map: this.adventurerTexture,
+      transparent: true,
+      alphaTest: 0.08,
+      depthWrite: false,
+      depthTest: true,
+    });
+    const adventurer = new THREE.Sprite(adventurerMaterial);
+    adventurer.name = 'CenterDungeonAdventurer';
+    adventurer.position.set(playerX, playerHeight + 0.68, playerZ);
+    adventurer.scale.set(0.95, 1.35, 1);
+    adventurer.renderOrder = 3;
+    this.worldGroup.add(adventurer);
+
     this.lightEmitters = tileEngine.emitters;
     this.lastTargetX = NaN;
     this.lastTargetZ = NaN;
@@ -481,23 +583,11 @@ export class TileRenderer {
    * - Calculates multi-tier simple color intensity gradients across all 64x64 tiles
    * - Ambient light is OFF and no black shadow boxes are used
    */
-  private computeFakeLighting(orbX: number, orbY: number, orbZ: number): void {
+  private computeFakeLighting(): void {
     // 1. Render Visual Fake Light Source Meshes
     let sourceIdx = 0;
 
-    // A) Main Orbiting Sun / Ember Orb Light Source
-    _tempVec3_1.set(orbX, orbY, orbZ);
-    const orbPulse = 0.8 + Math.sin(this.time * 3.0) * 0.15;
-    _tempVec3_2.set(orbPulse, orbPulse, orbPulse);
-    _tempQuat_1.setFromAxisAngle(_upVec, this.time * 2.0);
-    _tempMat4_1.compose(_tempVec3_1, _tempQuat_1, _tempVec3_2);
-
-    this.fakeLightSourcesMesh.setMatrixAt(sourceIdx, _tempMat4_1);
-    _tempColor_1.setHex(0xffea00); // Bright golden yellow
-    this.fakeLightSourcesMesh.setColorAt(sourceIdx, _tempColor_1);
-    sourceIdx++;
-
-    // B) Emitters (Torches, Campfires, Chests, Portals)
+    // Emitters (Torches, Campfires, Chests, Portals)
     const numEmitters = Math.min(24, this.lightEmitters.length);
     for (let i = 0; i < numEmitters; i++) {
       const e = this.lightEmitters[i];
@@ -532,12 +622,6 @@ export class TileRenderer {
         const worldX = c - 31.5;
         const worldZ = r - 31.5;
 
-        // Distance from orbiting orb light
-        const dxOrb = worldX - orbX;
-        const dzOrb = worldZ - orbZ;
-        const dOrbSq = dxOrb * dxOrb + dzOrb * dzOrb;
-        const orbIntensity = dOrbSq < 1024 ? Math.max(0, 1.0 - Math.sqrt(dOrbSq) / 32.0) : 0;
-
         // Distance from closest light emitters
         let maxEmitterAtt = 0;
 
@@ -558,7 +642,7 @@ export class TileRenderer {
         }
 
         // Total fake illumination score (0.0 to 1.0)
-        const totalIntensity = Math.min(1.0, 0.3 + orbIntensity * 0.7 + maxEmitterAtt * 0.6);
+        const totalIntensity = Math.min(1.0, 0.3 + maxEmitterAtt * 0.6);
 
         // Simple distinct colors at different intensity thresholds
         if (totalIntensity > 0.82) {
@@ -599,6 +683,8 @@ export class TileRenderer {
     if (!isPaused) {
       this.time += delta;
     }
+
+    this.poolManager.updateWaterAnimation(this.time);
 
     // 1. WASD / Arrow Key Camera Movement with ZERO allocations
     if (!isPaused && pressedKeys.size > 0 && this.activeCamera && this.controls) {
@@ -658,10 +744,6 @@ export class TileRenderer {
     _lightFrustum.setFromProjectionMatrix(_lightProjScreenMatrix);
 
     // 3. Lighting Pipeline Update (Real-Time vs Fake Light)
-    const orbX = Math.cos(this.time * 0.6) * 26.88;
-    const orbZ = Math.sin(this.time * 0.6) * 26.88;
-    const orbY = 4.0 + Math.sin(this.time * 2.0) * 1.5;
-
     if (this.lightType === 'fake') {
       this.fakeLightGroup.visible = true;
 
@@ -669,15 +751,15 @@ export class TileRenderer {
       // them in Three.js' forward-light shader permutation.
       this.dirLight.visible = false;
       this.fillLight.visible = false;
-      this.orbLight.visible = false;
       this.centerLight.visible = false;
+      this.mouseLight.visible = false;
       this.ambientLight.visible = false;
 
       for (let i = 0; i < this.lightPool.length; i++) {
         this.lightPool[i].visible = false;
       }
 
-      this.computeFakeLighting(orbX, orbY, orbZ);
+      this.computeFakeLighting();
       this.lastLightType = 'fake';
 
     } else {
@@ -686,8 +768,8 @@ export class TileRenderer {
       const enteringRealtime = this.lastLightType !== 'realtime';
       this.dirLight.visible = true;
       this.fillLight.visible = true;
-      this.orbLight.visible = true;
       this.centerLight.visible = true;
+      this.mouseLight.visible = this.mouseLightActive;
       this.ambientLight.visible = true;
 
       // Smooth Day/Night Celestial Sun Position
@@ -757,10 +839,9 @@ export class TileRenderer {
         }
       }
 
-      // Point Light Pooling: retain emitters while any part of their illumination
-      // radius intersects the current camera frustum. Testing only the source
-      // point turns a light off too early when it is just beyond the frame edge
-      // but still lights visible tiles.
+      // Point Light Pooling: assignments are sticky while any part of their
+      // illumination radius remains on screen. Culling only the emitter position
+      // switches a light off while it can still illuminate visible geometry.
       if (this.controls && this.lightEmitters.length > 0) {
         const fx = this.controls.target.x;
         const fz = this.controls.target.z;
@@ -787,37 +868,65 @@ export class TileRenderer {
 
         const nightFactor = sunY < 0 ? 2.2 : 1.0;
 
-        let poolIndex = 0;
-        for (let i = 0; i < this.lightEmitters.length && poolIndex < this.lightPool.length; i++) {
-          const e = this.lightEmitters[i];
-          const effectiveDistance = e.distance * (sunY < 0 ? 1.2 : 1.0);
-          _lightInfluenceSphere.center.set(e.x, e.y, e.z);
-          _lightInfluenceSphere.radius = effectiveDistance;
-          if (_lightFrustum.intersectsSphere(_lightInfluenceSphere)) {
-            const pl = this.lightPool[poolIndex++];
+        // First retain existing assignments that are still visibly on screen.
+        for (let i = 0; i < this.lightPool.length; i++) {
+          const e = this.pooledEmitters[i];
+          const pl = this.lightPool[i];
+          if (e) {
+            _lightInfluenceSphere.center.set(e.x, e.y, e.z);
+            _lightInfluenceSphere.radius = e.distance * (sunY < 0 ? 1.2 : 1.0);
+          }
+
+          if (e && _lightFrustum.intersectsSphere(_lightInfluenceSphere)) {
             pl.position.set(e.x, e.y, e.z);
             pl.color.set(e.color);
             pl.intensity = e.intensity * nightFactor;
-            pl.distance = effectiveDistance;
+            pl.distance = _lightInfluenceSphere.radius;
             pl.visible = true;
+          } else {
+            this.pooledEmitters[i] = null;
+            pl.visible = false;
           }
         }
 
-        // Any unused pooled light must be removed from Three.js' render list.
-        for (let i = poolIndex; i < this.lightPool.length; i++) {
-          this.lightPool[i].visible = false;
+        // Fill newly available slots with the nearest currently visible emitters.
+        for (let emitterIndex = 0; emitterIndex < this.lightEmitters.length; emitterIndex++) {
+          const e = this.lightEmitters[emitterIndex];
+          const effectiveDistance = e.distance * (sunY < 0 ? 1.2 : 1.0);
+          _lightInfluenceSphere.center.set(e.x, e.y, e.z);
+          _lightInfluenceSphere.radius = effectiveDistance;
+          if (!_lightFrustum.intersectsSphere(_lightInfluenceSphere)) continue;
+
+          let alreadyAssigned = false;
+          let freePoolIndex = -1;
+          for (let poolIndex = 0; poolIndex < this.lightPool.length; poolIndex++) {
+            if (this.pooledEmitters[poolIndex] === e) {
+              alreadyAssigned = true;
+              break;
+            }
+            if (freePoolIndex < 0 && this.pooledEmitters[poolIndex] === null) {
+              freePoolIndex = poolIndex;
+            }
+          }
+
+          if (alreadyAssigned) continue;
+          if (freePoolIndex < 0) break;
+
+          const pl = this.lightPool[freePoolIndex];
+          this.pooledEmitters[freePoolIndex] = e;
+          pl.position.set(e.x, e.y, e.z);
+          pl.color.set(e.color);
+          pl.intensity = e.intensity * nightFactor;
+          pl.distance = effectiveDistance;
+          pl.visible = true;
         }
       } else {
         for (let i = 0; i < this.lightPool.length; i++) {
+          this.pooledEmitters[i] = null;
           this.lightPool[i].visible = false;
         }
       }
 
-      if (this.orbLight) {
-        this.orbLight.position.set(orbX, orbY, orbZ);
-        this.orbLight.intensity = sunY < 0 ? 0.8 : 2.0;
-        this.orbLight.distance = sunY < 0 ? 14 : 35;
-      }
 
       if (this.centerLight) {
         this.centerLight.intensity = sunY >= 0 ? 0.2 * sunY : 0;

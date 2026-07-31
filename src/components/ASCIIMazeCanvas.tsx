@@ -314,6 +314,13 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
     tileRenderer.lightType = lightTypeRef.current;
     rendererInstanceRef.current = tileRenderer;
 
+    const handlePointerMove = (event: PointerEvent) => {
+      tileRenderer.updateMouseLightFromPointer(event.clientX, event.clientY);
+    };
+    const handlePointerLeave = () => tileRenderer.hideMouseLight();
+    tileRenderer.renderer.domElement.addEventListener('pointermove', handlePointerMove);
+    tileRenderer.renderer.domElement.addEventListener('pointerleave', handlePointerLeave);
+
     const handleControlsChange = () => {
       if (hasInitializedCameraRef.current) {
         scheduleSaveCameraState(tileRenderer, isOrthographicRef.current, showCameraSaveToast);
@@ -417,6 +424,8 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       cancelAnimationFrame(animationFrameId);
       tileRenderer.controls.removeEventListener('change', handleControlsChange);
+      tileRenderer.renderer.domElement.removeEventListener('pointermove', handlePointerMove);
+      tileRenderer.renderer.domElement.removeEventListener('pointerleave', handlePointerLeave);
       window.removeEventListener('resize', handleResize);
       resizeObserver.disconnect();
       tileRenderer.dispose();

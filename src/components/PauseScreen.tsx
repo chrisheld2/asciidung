@@ -557,7 +557,7 @@ export const PauseScreen: React.FC<PauseScreenProps> = ({
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-black/80 backdrop-blur-lg select-none font-mono">
       {/* Container Window */}
       <div
-        className="relative w-full max-w-4xl max-h-[90vh] bg-zinc-950 border rounded-xl shadow-2xl flex flex-col overflow-hidden text-zinc-200"
+        className="relative w-full max-w-4xl h-[90vh] max-h-[90vh] bg-zinc-950 border rounded-xl shadow-2xl flex flex-col overflow-hidden text-zinc-200"
         style={{
           borderColor: theme.fg,
           boxShadow: `0 0 40px ${theme.fg}33, inset 0 0 15px ${theme.fg}11`,
@@ -1296,7 +1296,7 @@ export const PauseScreen: React.FC<PauseScreenProps> = ({
                   Performant Light Source Optimization (Dynamic Light Pooling)
                 </h3>
                 <p className="text-xs text-zinc-400 leading-relaxed">
-                  To achieve 60+ FPS without WebGL shader pipeline stalls, dynamic light emitters (torches, mushrooms, crystals, lava) are scanned across the 64x64 world grid and sorted dynamically by camera distance. Only the <strong>top 18 nearest active point lights</strong> are rendered in real time.
+                  To achieve 60+ FPS without WebGL shader pipeline stalls, dynamic light emitters (torches, mushrooms, crystals, lava) are scanned across the 64x64 world grid and sorted dynamically by camera distance. Up to <strong>6 visible point lights</strong> are rendered in real time, and active lights retain their slots until they leave the camera view.
                 </p>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3 text-xs">
