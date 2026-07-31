@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>asciidung - Interactive 3D ASCII Maze Scene</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+    }
+    body, html {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #000000;
+      color: #00ff66;
+      font-family: 'Courier New', Courier, monospace;
+    }
+    #canvas-container {
+      width: 100vw;
+      height: 100vh;
+      display: block;
+      position: absolute;
+      top: 0;
+      left: 0;
+      z-index: 1;
+    }
+    .crt-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      pointer-events: none;
+      z-index: 10;
+      background: linear-gradient(
+        rgba(18, 16, 16, 0) 50%, 
+        rgba(0, 0, 0, 0.25) 50%
+      ), linear-gradient(
+        90deg,
+        rgba(255, 0, 0, 0.03),
+        rgba(0, 255, 0, 0.01),
+        rgba(0, 0, 255, 0.03)
+      );
+      background-size: 100% 4px, 6px 100%;
+    }
+    .hud-panel {
+      position: fixed;
+      z-index: 20;
+      background: rgba(5, 10, 5, 0.88);
+      border: 1px solid #00ff66;
+      box-shadow: 0 0 15px rgba(0, 255, 102, 0.2);
+      padding: 12px 16px;
+      border-radius: 4px;
+      backdrop-filter: blur(4px);
+    }
+    .hud-header {
+      top: 16px;
+      left: 16px;
+      max-width: 380px;
+    }
+    .hud-title {
+      font-size: 16px;
+      font-weight: bold;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      color: #00ff66;
+      text-shadow: 0 0 8px #00ff66;
+    }
+    .hud-subtitle {
+      font-size: 11px;
+      color: #00aa44;
+      margin-top: 4px;
+    }
+    .hud-stats {
+      margin-top: 10px;
+      font-size: 11px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      border-top: 1px dashed rgba(0, 255, 102, 0.3);
+      padding-top: 8px;
+    }
+    .hud-stat-val {
+      color: #ffffff;
+      font-weight: bold;
+    }
+    .hud-controls {
+      bottom: 16px;
+      left: 16px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .btn {
+      background: #002200;
+      color: #00ff66;
+      border: 1px solid #00ff66;
+      padding: 8px 12px;
+      font-family: inherit;
+      font-size: 12px;
+      font-weight: bold;
+      cursor: pointer;
+      border-radius: 3px;
+      transition: all 0.2s ease;
+    }
+    .btn:hover {
+      background: #00ff66;
+      color: #000000;
+      box-shadow: 0 0 10px #00ff66;
+    }
+    .hud-help {
+      top: 16px;
+      right: 16px;
+      font-size: 11px;
+      color: #00cc55;
+      text-align: right;
+    }
+  </style>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+  <div class="crt-overlay"></div>
+  <div id="canvas-container"></div>
+
+  <div class="hud-panel hud-header">
+    <div class="hud-title">[ASCIIDUNG v1.0]</div>
+    <div class="hud-subtitle">3D ASCII-Textured Mini-Maze Scene</div>
+    <div class="hud-stats">
+      <div>Grid Size: <span id="stat-grid" class="hud-stat-val">11x11</span></div>
+      <div>Walls: <span id="stat-walls" class="hud-stat-val">0</span></div>
+      <div>Translucent: <span id="stat-trans" class="hud-stat-val">0</span></div>
+      <div>Theme: <span id="stat-theme" class="hud-stat-val">Matrix Green</span></div>
+    </div>
+  </div>
+
+  <div class="hud-panel hud-controls">
+    <button class="btn" id="btn-regen">⚡ Regenerate Maze</button>
+    <button class="btn" id="btn-trans">🪟 Toggle Translucency</button>
+    <button class="btn" id="btn-theme">🎨 Cycle Theme</button>
+    <button class="btn" id="btn-rotate">🔄 Toggle Auto-Rotate</button>
+    <button class="btn" id="btn-reset">🎥 Center Camera</button>
+  </div>
+
+  <div class="hud-panel hud-help">
+    🖱️ Left Click + Drag: Orbit<br/>
+    🖱️ Right Click + Drag: Pan<br/>
+    📜 Scroll: Zoom
+  </div>
+
+  <script>
+    const ASCII_CHARS = ['@', '#', '%', '&', '*', '+', '?', 'A', 'Z', '8', '$', '!', 'X', 'O', '0'];
+
+    const THEMES = [
+      { name: 'Matrix Green', fg: '#00ff66', bg: '#000000', light: '#00ff88', ambient: '#0a1a0f' },
+      { name: 'Cyber Cyan', fg: '#00e5ff', bg: '#000000', light: '#00b0ff', ambient: '#0a1520' },
+      { name: 'Amber Terminal', fg: '#ffb300', bg: '#000000', light: '#ff9100', ambient: '#1f1300' },
+      { name: 'Neon Magenta', fg: '#ff00aa', bg: '#000000', light: '#ff00aa', ambient: '#1a0010' }
+    ];
+
+    let currentThemeIdx = 0;
+    let translucencyRatio = 0.18;
+    let autoRotate = true;
+
+    let scene, camera, renderer, controls;
+    let wallGroup, floorMesh, centerPointLight, ambientLight, orbitingLight, glowingOrb;
+
+    let currentMaze = [
+      [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+      [1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1],
+      [1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1],
+      [1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1],
+      [1, 0, 1, 1, 1, 1, 1, 0, 1, 0, 1],
+      [1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1],
+      [1, 1, 1, 0, 1, 0, 1, 1, 1, 0, 1],
+      [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1],
+      [1, 0, 1, 1, 1, 1, 1, 0, 1, 0, 1],
+      [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+      [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    ];
+
+    function createASCIITexture(char, fgColor, bgColor = '#000000') {
+      const canvas = document.createElement('canvas');
+      canvas.width = 256;
+      canvas.height = 256;
+      const ctx = canvas.getContext('2d');
+
+      ctx.fillStyle = bgColor;
+      ctx.fillRect(0, 0, 256, 256);
+
+      ctx.font = 'bold 160px "Courier New", Consolas, monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+
+      ctx.shadowColor = fgColor;
+      ctx.shadowBlur = 12;
+      ctx.fillStyle = fgColor;
+      ctx.fillText(char, 128, 128);
+
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.needsUpdate = true;
+      return texture;
+    }
+
+    function createFloorTexture(fgColor, bgColor = '#000000') {
+      const canvas = document.createElement('canvas');
+      canvas.width = 64;
+      canvas.height = 64;
+      const ctx = canvas.getContext('2d');
+
+      ctx.fillStyle = bgColor;
+      ctx.fillRect(0, 0, 64, 64);
+
+      const texture = new THREE.CanvasTexture(canvas);
+      return texture;
+    }
+
+    function generateRandomMaze(rows = 11, cols = 11) {
+      const grid = Array.from({ length: rows }, () => Array(cols).fill(1));
+      function carve(r, c) {
+        grid[r][c] = 0;
+        const dirs = [[-2, 0], [2, 0], [0, -2], [0, 2]].sort(() => Math.random() - 0.5);
+        for (const [dr, dc] of dirs) {
+          const nr = r + dr, nc = c + dc;
+          if (nr > 0 && nr < rows - 1 && nc > 0 && nc < cols - 1 && grid[nr][nc] === 1) {
+            grid[r + dr / 2][c + dc / 2] = 0;
+            carve(nr, nc);
+          }
+        }
+      }
+      carve(1, 1);
+      return grid;
+    }
+
+    function init() {
+      const container = document.getElementById('canvas-container');
+
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x000000);
+      scene.fog = new THREE.FogExp2(0x000000, 0.035);
+
+      camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.shadowMap.enabled = true;
+      container.appendChild(renderer.domElement);
+
+      const OrbitControlsClass = THREE.OrbitControls || OrbitControls;
+      controls = new OrbitControlsClass(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.05;
+
+      const theme = THEMES[currentThemeIdx];
+      ambientLight = new THREE.AmbientLight(theme.ambient, 0.7);
+      scene.add(ambientLight);
+
+      centerPointLight = new THREE.PointLight(theme.light, 2.0, 25);
+      centerPointLight.castShadow = true;
+      scene.add(centerPointLight);
+
+      orbitingLight = new THREE.PointLight(0xff00aa, 1.5, 18);
+      scene.add(orbitingLight);
+
+      const orbGeo = new THREE.SphereGeometry(0.15, 16, 16);
+      const orbMat = new THREE.MeshBasicMaterial({ color: 0xff00aa });
+      glowingOrb = new THREE.Mesh(orbGeo, orbMat);
+      scene.add(glowingOrb);
+
+      wallGroup = new THREE.Group();
+      scene.add(wallGroup);
+
+      buildWorld();
+
+      window.addEventListener('resize', onWindowResize);
+      setupUI();
+      animate();
+    }
+
+    function buildWorld() {
+      while (wallGroup.children.length > 0) {
+        const child = wallGroup.children.pop();
+        if (child.geometry) child.geometry.dispose();
+      }
+      if (floorMesh) {
+        scene.remove(floorMesh);
+        floorMesh.geometry.dispose();
+      }
+
+      const theme = THEMES[currentThemeIdx];
+      const rows = currentMaze.length;
+      const cols = currentMaze[0].length;
+
+      const floorGeo = new THREE.PlaneGeometry(cols, rows);
+      const floorTex = createFloorTexture(theme.fg, theme.bg);
+      floorMesh = new THREE.Mesh(floorGeo, new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.8 }));
+      floorMesh.rotation.x = -Math.PI / 2;
+      floorMesh.position.set(cols / 2 - 0.5, -0.5, rows / 2 - 0.5);
+      floorMesh.receiveShadow = true;
+      scene.add(floorMesh);
+
+      const boxGeo = new THREE.BoxGeometry(0.98, 0.98, 0.98);
+      let wallCount = 0;
+      let transCount = 0;
+
+      const opaqueBlackMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
+      const transBlackMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.7, depthWrite: false });
+
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          if (currentMaze[r][c] === 1) {
+            wallCount++;
+            const char = ASCII_CHARS[(r * cols + c) % ASCII_CHARS.length];
+            const isTranslucent = Math.random() < translucencyRatio;
+
+            if (isTranslucent) transCount++;
+
+            const tex = createASCIITexture(char, theme.fg, theme.bg);
+
+            const topMat = new THREE.MeshBasicMaterial({
+              map: tex,
+              color: 0xffffff,
+              transparent: isTranslucent,
+              opacity: isTranslucent ? 0.7 : 1.0,
+              depthWrite: !isTranslucent,
+              side: THREE.DoubleSide
+            });
+
+            const sideMat = isTranslucent ? transBlackMat : opaqueBlackMat;
+            const mats = [sideMat, sideMat, topMat, sideMat, sideMat, sideMat];
+
+            const mesh = new THREE.Mesh(boxGeo, mats);
+            mesh.position.set(c, 0, r);
+            wallGroup.add(mesh);
+          }
+        }
+      }
+
+      const centerX = cols / 2 - 0.5;
+      const centerZ = rows / 2 - 0.5;
+
+      centerPointLight.position.set(centerX, 3.5, centerZ);
+      controls.target.set(centerX, 0, centerZ);
+      camera.position.set(centerX + cols * 1.1, rows * 1.0, centerZ + rows * 1.1);
+      controls.update();
+
+      document.getElementById('stat-grid').textContent = `${cols}x${rows}`;
+      document.getElementById('stat-walls').textContent = wallCount;
+      document.getElementById('stat-trans').textContent = `${transCount} (${Math.round((transCount/wallCount)*100)}%)`;
+      document.getElementById('stat-theme').textContent = theme.name;
+    }
+
+    function setupUI() {
+      document.getElementById('btn-regen').onclick = () => { currentMaze = generateRandomMaze(11, 11); buildWorld(); };
+      document.getElementById('btn-trans').onclick = () => { translucencyRatio = translucencyRatio === 0.18 ? 0.35 : (translucencyRatio === 0.35 ? 0.0 : 0.18); buildWorld(); };
+      document.getElementById('btn-theme').onclick = () => {
+        currentThemeIdx = (currentThemeIdx + 1) % THEMES.length;
+        const theme = THEMES[currentThemeIdx];
+        ambientLight.color.set(theme.ambient);
+        centerPointLight.color.set(theme.light);
+        buildWorld();
+      };
+      document.getElementById('btn-rotate').onclick = () => { autoRotate = !autoRotate; };
+      document.getElementById('btn-reset').onclick = () => {
+        const cols = currentMaze[0].length, rows = currentMaze.length;
+        controls.target.set(cols / 2 - 0.5, 0, rows / 2 - 0.5);
+        camera.position.set(cols / 2 - 0.5 + cols * 1.1, rows * 1.0, rows / 2 - 0.5 + rows * 1.1);
+      };
+    }
+
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    let time = 0;
+    function animate() {
+      requestAnimationFrame(animate);
+      time += 0.015;
+
+      if (autoRotate) wallGroup.rotation.y += 0.003; else wallGroup.rotation.y = 0;
+
+      const cols = currentMaze[0].length, rows = currentMaze.length;
+      const centerX = cols / 2 - 0.5, centerZ = rows / 2 - 0.5;
+
+      const orbX = centerX + Math.cos(time * 0.8) * (cols * 0.45);
+      const orbZ = centerZ + Math.sin(time * 0.8) * (rows * 0.45);
+      const orbY = 1.2 + Math.sin(time * 2.0) * 0.5;
+
+      orbitingLight.position.set(orbX, orbY, orbZ);
+      glowingOrb.position.set(orbX, orbY, orbZ);
+
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+{
+  "name": "asciidung",
+  "description": "Interactive 3D ASCII natural world landscape with 64x64 biomes, ancient ruins, and procedural dungeons using Three.js",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
