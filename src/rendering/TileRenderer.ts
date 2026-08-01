@@ -722,6 +722,33 @@ export class TileRenderer {
         cam.position.add(_panDeltaVec);
         controls.target.add(_panDeltaVec);
       }
+
+      // Q / E zoom: dolly toward/away from the orbit target (perspective)
+      // or adjust zoom factor (orthographic).
+      if (pressedKeys.has('q') || pressedKeys.has('e')) {
+        if (cam instanceof THREE.OrthographicCamera) {
+          const zoomFactor = 1.04;
+          if (pressedKeys.has('q')) {
+            cam.zoom = Math.min(controls.maxZoom, cam.zoom * zoomFactor);
+          }
+          if (pressedKeys.has('e')) {
+            cam.zoom = Math.max(controls.minZoom, cam.zoom / zoomFactor);
+          }
+          cam.updateProjectionMatrix();
+        } else if (cam instanceof THREE.PerspectiveCamera) {
+          const dist = cam.position.distanceTo(controls.target);
+          const dollySpeed = Math.max(0.4, dist * 0.03);
+          _tempVec3_1.copy(cam.position).sub(controls.target).normalize();
+          if (pressedKeys.has('q')) {
+            const newDist = Math.max(controls.minDistance, dist - dollySpeed);
+            cam.position.copy(controls.target).addScaledVector(_tempVec3_1, newDist);
+          }
+          if (pressedKeys.has('e')) {
+            const newDist = Math.min(controls.maxDistance, dist + dollySpeed);
+            cam.position.copy(controls.target).addScaledVector(_tempVec3_1, newDist);
+          }
+        }
+      }
     }
 
     // 2. Camera Auto-Rotation via OrbitControls

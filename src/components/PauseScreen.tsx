@@ -2,49 +2,7 @@ import React, { useState, useMemo, useEffect } from 'react';
 import { PauseTab, ColorTheme, MazeStats, CameraPreset, SpritePackType, RenderMetrics, LightType } from '../types';
 import { COLOR_THEMES, SPRITE_PACKS, playTerminalBeep, generateStandaloneHTML } from '../utils/sprites';
 import { formatInGameTime } from './HUDControls';
-import {
-  Play,
-  Pause,
-  Maximize2,
-  Minimize2,
-  BarChart2,
-  Palette,
-  Camera,
-  Volume2,
-  VolumeX,
-  Sparkles,
-  RefreshCw,
-  RotateCw,
-  Box,
-  Focus,
-  Download,
-  Grid,
-  Clock,
-  Activity,
-  Cpu,
-  X,
-  Sliders,
-  Layers,
-  Trash2,
-  Monitor,
-  Check,
-  ShieldAlert,
-  Flame,
-  TreePine,
-  Mountain,
-  Waves,
-  Castle,
-  KeyRound,
-  Compass,
-  Sun,
-  Moon,
-  Lock,
-  Unlock,
-  FastForward,
-  Zap,
-  Lightbulb,
-  Search
-} from 'lucide-react';
+import { Play, Pause, Maximize2, Minimize2, ChartBar as BarChart2, Palette, Camera, Volume2, VolumeX, Sparkles, RefreshCw, RotateCw, Box, Focus, Download, Grid2x2 as Grid, Clock, Activity, Cpu, X, FileSliders as Sliders, Layers, Trash2, Monitor, Check, ShieldAlert, Flame, TreePine, Mountain, Waves, Castle, KeyRound, Compass, Sun, Moon, Lock, Clock as Unlock, FastForward, Zap, Lightbulb, Search } from 'lucide-react';
 
 export interface SearchableUIElement {
   id: string;
@@ -1059,6 +1017,12 @@ export const PauseScreen: React.FC<PauseScreenProps> = ({
                       Left Mouse Drag
                     </span>
                     <div className="text-[11px] text-zinc-400 mt-1.5">Orbit Camera</div>
+                  </div>
+                  <div className="bg-zinc-950 p-2.5 rounded border border-zinc-800 text-center">
+                    <span className="px-1.5 py-0.5 rounded bg-zinc-800 border border-zinc-700 text-zinc-200 font-bold text-[11px]">
+                      Q / E
+                    </span>
+                    <div className="text-[11px] text-zinc-400 mt-1.5">Zoom Camera In / Out</div>
                   </div>
                   <div className="bg-zinc-950 p-2.5 rounded border border-zinc-800 text-center">
                     <span className="px-1.5 py-0.5 rounded bg-zinc-800 border border-zinc-700 text-zinc-200 font-bold text-[11px]">

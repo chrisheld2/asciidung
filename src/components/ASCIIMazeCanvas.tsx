@@ -269,10 +269,10 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
 
       const key = e.key.toLowerCase();
       if (
-        ['arrowleft', 'arrowright', 'arrowup', 'arrowdown', 'a', 'd', 'w', 's'].includes(key)
+        ['arrowleft', 'arrowright', 'arrowup', 'arrowdown', 'a', 'd', 'w', 's', 'q', 'e'].includes(key)
       ) {
         pressedKeysRef.current.add(key);
-        if (['arrowleft', 'arrowright', 'arrowup', 'arrowdown'].includes(key)) {
+        if (['arrowleft', 'arrowright', 'arrowup', 'arrowdown', 'q', 'e'].includes(key)) {
           e.preventDefault();
         }
       }
