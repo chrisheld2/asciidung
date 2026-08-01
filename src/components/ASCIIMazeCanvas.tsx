@@ -63,7 +63,13 @@ const saveCameraStateImmediate = (tileRenderer: TileRenderer | null, isOrthograp
 
   if (isValidCameraState(state)) {
     try {
-      localStorage.setItem(CAMERA_STORAGE_KEY, JSON.stringify(state));
+      const serializedState = JSON.stringify(state);
+      // The periodic checkpoint also runs while the camera is idle. Avoid
+      // rewriting storage when the camera state has not changed.
+      if (localStorage.getItem(CAMERA_STORAGE_KEY) === serializedState) {
+        return false;
+      }
+      localStorage.setItem(CAMERA_STORAGE_KEY, serializedState);
       return true;
     } catch {
       // Ignore storage errors

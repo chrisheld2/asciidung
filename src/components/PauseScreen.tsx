@@ -512,7 +512,7 @@ export const PauseScreen: React.FC<PauseScreenProps> = ({
   const currentPackDef = SPRITE_PACKS.find((p) => p.id === spritePack) || SPRITE_PACKS[0];
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-black/80 backdrop-blur-lg select-none font-mono">
+    <div className="tui-pause fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-black/80 backdrop-blur-lg select-none font-mono">
       {/* Container Window */}
       <div
         className="relative w-full max-w-4xl h-[90vh] max-h-[90vh] bg-zinc-950 border rounded-xl shadow-2xl flex flex-col overflow-hidden text-zinc-200"

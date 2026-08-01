@@ -192,7 +192,7 @@ export const HUDControls: React.FC<HUDControlsProps> = ({
   const currentPackDef = SPRITE_PACKS.find((p) => p.id === spritePack) || SPRITE_PACKS[0];
 
   return (
-    <div className="pointer-events-none fixed inset-0 z-20 flex flex-col justify-between p-3 sm:p-4 font-mono select-none">
+    <div className="tui-hud pointer-events-none fixed inset-0 z-20 flex flex-col justify-between p-3 sm:p-4 font-mono select-none">
       {/* Top Bar: Title & Biome Legend */}
       <div className="flex flex-col sm:flex-row justify-between items-start gap-3 w-full">
         {/* Header HUD */}

@@ -1,1 +1,156 @@
 @import "tailwindcss";
+
+/* Screen-space interface only: keep the WebGL scene visually independent. */
+:root {
+  --tui-ink: #050b09;
+  --tui-panel: rgba(5, 14, 11, 0.94);
+  --tui-line: rgba(128, 255, 190, 0.34);
+  --tui-muted: #83a092;
+  --tui-text: #d8ffe4;
+}
+
+.tui-hud,
+.tui-pause {
+  color: var(--tui-text);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  letter-spacing: 0.025em;
+}
+
+.tui-hud .bg-black\/90,
+.tui-hud .bg-zinc-950,
+.tui-hud .bg-zinc-950\/80,
+.tui-hud .bg-zinc-900,
+.tui-hud .bg-zinc-900\/90,
+.tui-pause .bg-zinc-950,
+.tui-pause .bg-zinc-950\/90,
+.tui-pause .bg-zinc-900,
+.tui-pause .bg-zinc-900\/50,
+.tui-pause .bg-zinc-900\/90,
+.tui-pause .bg-zinc-900\/95 {
+  background-color: var(--tui-panel);
+}
+
+.tui-hud [class*="rounded"],
+.tui-pause [class*="rounded"] {
+  border-radius: 0 !important;
+}
+
+.tui-hud .border,
+.tui-pause .border,
+.tui-pause [class*="border-"] {
+  border-color: var(--tui-line);
+}
+
+.tui-hud .shadow-lg,
+.tui-hud .backdrop-blur-md,
+.tui-pause .shadow-2xl,
+.tui-pause .backdrop-blur-md {
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
+.tui-hud .pointer-events-auto {
+  box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.62);
+}
+
+.tui-hud .pointer-events-auto > .bg-black\/90,
+.tui-hud .pointer-events-auto.bg-black\/90,
+.tui-hud .pointer-events-auto.bg-zinc-950,
+.tui-hud .pointer-events-auto.bg-zinc-900 {
+  position: relative;
+}
+
+.tui-hud h1,
+.tui-pause h2 {
+  text-shadow: 0 0 8px currentColor;
+}
+
+.tui-hud h1::before {
+  content: "> ";
+}
+
+.tui-hud h1::after {
+  content: "_";
+  display: inline-block;
+  margin-left: 0.15rem;
+  animation: tui-cursor 1s steps(1, end) infinite;
+}
+
+.tui-hud button,
+.tui-pause button {
+  border-radius: 0 !important;
+  text-transform: uppercase;
+  letter-spacing: 0.055em;
+}
+
+.tui-hud button:hover,
+.tui-pause button:hover {
+  background-color: rgba(128, 255, 190, 0.13) !important;
+  box-shadow: inset 3px 0 0 currentColor;
+}
+
+.tui-hud button:focus-visible,
+.tui-pause button:focus-visible,
+.tui-pause input:focus-visible {
+  outline: 1px solid currentColor;
+  outline-offset: 2px;
+}
+
+.tui-pause {
+  background:
+    linear-gradient(rgba(0, 0, 0, 0.75), rgba(0, 0, 0, 0.88)),
+    repeating-linear-gradient(0deg, transparent 0 3px, rgba(136, 255, 191, 0.035) 3px 4px);
+  backdrop-filter: none;
+}
+
+.tui-pause > div {
+  max-width: 68rem;
+  height: min(90vh, 52rem);
+  background-color: #07100c;
+  border-radius: 0 !important;
+  box-shadow: 8px 8px 0 rgba(0, 0, 0, 0.64), inset 0 0 0 1px rgba(152, 255, 202, 0.11) !important;
+}
+
+.tui-pause > div::before {
+  content: "[ SPRITEDUNG TERMINAL // SESSION HALTED ]";
+  position: absolute;
+  top: -1.55rem;
+  left: -1px;
+  padding: 0.25rem 0.5rem;
+  color: var(--tui-text);
+  background: #07100c;
+  border: 1px solid var(--tui-line);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+}
+
+.tui-pause input {
+  border-radius: 0 !important;
+  background-color: #030805 !important;
+  color: var(--tui-text) !important;
+  caret-color: #9affc4;
+}
+
+.tui-pause input::placeholder { color: var(--tui-muted); }
+
+.tui-pause .text-zinc-500,
+.tui-pause .text-zinc-400,
+.tui-hud .text-zinc-500,
+.tui-hud .text-zinc-400 { color: var(--tui-muted); }
+
+.tui-pause .text-white,
+.tui-pause .text-zinc-200,
+.tui-pause .text-zinc-300,
+.tui-hud .text-white,
+.tui-hud .text-zinc-200,
+.tui-hud .text-zinc-300 { color: var(--tui-text); }
+
+.tui-pause kbd {
+  border: 1px solid var(--tui-line);
+  background: #07100c !important;
+  border-radius: 0 !important;
+}
+
+@keyframes tui-cursor {
+  50% { opacity: 0; }
+}
