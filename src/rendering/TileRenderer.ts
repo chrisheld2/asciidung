@@ -166,7 +166,11 @@ export class TileRenderer {
     // 2. Cameras
     const aspect = container.clientWidth / container.clientHeight || 1;
 
-    this.perspCamera = new THREE.PerspectiveCamera(45, aspect, 0.1, 3000);
+    // Near/far are sized to the world, not left at 0.1/3000. A 30,000:1 depth
+    // range spends almost all of its precision in the first few units and
+    // invites z-fighting; the whole scene lives within a couple of hundred units
+    // of the camera.
+    this.perspCamera = new THREE.PerspectiveCamera(45, aspect, 0.5, 600);
 
     const mapDiagonal = Math.hypot(64, 64);
     const baseFrustumSize = Math.max(68, mapDiagonal * 0.78);

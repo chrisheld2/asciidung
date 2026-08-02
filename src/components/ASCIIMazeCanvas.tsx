@@ -1,6 +1,7 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef } from 'react';
 import * as THREE from 'three';
-import { ColorTheme, WorldCell, MazeStats, CameraPreset, SpritePackType, RenderMetrics, DayNightState, LightType } from '../types';
+import { ColorTheme, WorldCell, MazeStats, CameraPreset, SpritePackType, DayNightState, LightType } from '../types';
+import { renderMetricsStore } from '../utils/renderMetricsStore';
 import { TileDataEngine } from '../rendering/TileData';
 import { TileRenderer } from '../rendering/TileRenderer';
 
@@ -17,7 +18,6 @@ interface ASCIIMazeCanvasProps {
   isPaused?: boolean;
   dayNightState: DayNightState;
   onStatsChange: (stats: MazeStats) => void;
-  onRenderMetricsChange?: (metrics: RenderMetrics) => void;
 }
 
 const CAMERA_STORAGE_KEY = 'spritedung_camera_position_v3';
@@ -214,12 +214,11 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
     turnCount: 1,
   },
   onStatsChange,
-  onRenderMetricsChange,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const rendererInstanceRef = useRef<TileRenderer | null>(null);
   const tileEngineRef = useRef<TileDataEngine>(new TileDataEngine(64, 64));
-  const [isCameraSaveToastVisible, setIsCameraSaveToastVisible] = useState(false);
+  const cameraSaveToastRef = useRef<HTMLDivElement>(null);
   const cameraSaveToastTimerRef = useRef<number | null>(null);
 
   const isOrthographicRef = useRef(isOrthographic);
@@ -255,23 +254,23 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
     }
   }, [lightType]);
 
-  const onRenderMetricsChangeRef = useRef(onRenderMetricsChange);
-  useEffect(() => {
-    onRenderMetricsChangeRef.current = onRenderMetricsChange;
-  }, [onRenderMetricsChange]);
-
   const hasInitializedCameraRef = useRef(false);
   const isInitialPresetRef = useRef(true);
   const prevCenterTriggerRef = useRef(centerCameraTrigger);
   const pressedKeysRef = useRef<Set<string>>(new Set());
 
+  // Driven straight through the DOM. A transient toast that fires every few
+  // seconds while the camera moves does not need to re-render the component
+  // that owns the renderer.
   const showCameraSaveToast = () => {
-    setIsCameraSaveToastVisible(true);
+    const el = cameraSaveToastRef.current;
+    if (!el) return;
+    el.style.opacity = '1';
     if (cameraSaveToastTimerRef.current !== null) {
       window.clearTimeout(cameraSaveToastTimerRef.current);
     }
     cameraSaveToastTimerRef.current = window.setTimeout(() => {
-      setIsCameraSaveToastVisible(false);
+      if (cameraSaveToastRef.current) cameraSaveToastRef.current.style.opacity = '0';
       cameraSaveToastTimerRef.current = null;
     }, 1800);
   };
@@ -412,16 +411,14 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
         frameCount = 0;
         lastFpsTime = now;
 
-        if (onRenderMetricsChangeRef.current && tileRenderer.renderer) {
-          const info = tileRenderer.renderer.info;
-          onRenderMetricsChangeRef.current({
-            fps: measuredFps,
-            drawCalls: info.render.calls,
-            triangles: info.render.triangles,
-            geometries: info.memory.geometries,
-            textures: info.memory.textures,
-          });
-        }
+        const info = tileRenderer.renderer.info;
+        renderMetricsStore.set({
+          fps: measuredFps,
+          drawCalls: info.render.calls,
+          triangles: info.render.triangles,
+          geometries: info.memory.geometries,
+          textures: info.memory.textures,
+        });
       }
 
       tileRenderer.updateFrame(
@@ -589,14 +586,14 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
         ref={containerRef}
         className="absolute inset-0 w-full h-full overflow-hidden bg-black"
       />
-      {isCameraSaveToastVisible && (
-        <div
-          role="status"
-          className="pointer-events-none fixed right-4 bottom-4 z-50 rounded border border-emerald-400/70 bg-zinc-950/90 px-3 py-2 font-mono text-xs text-emerald-300 shadow-lg backdrop-blur"
-        >
-          Camera state saved
-        </div>
-      )}
+      <div
+        ref={cameraSaveToastRef}
+        role="status"
+        style={{ opacity: 0, transition: 'opacity 200ms' }}
+        className="pointer-events-none fixed right-4 bottom-4 z-50 rounded border border-emerald-400/70 bg-zinc-950/90 px-3 py-2 font-mono text-xs text-emerald-300 shadow-lg backdrop-blur"
+      >
+        Camera state saved
+      </div>
     </>
   );
 };

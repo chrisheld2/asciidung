@@ -550,3 +550,5 @@ const SpritePixelGrid: React.FC<{
     </div>
   );
 };
+
+export default SpriteAtlasModal;

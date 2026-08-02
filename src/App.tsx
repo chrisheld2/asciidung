@@ -1,10 +1,12 @@
-import React, { useState, useCallback, useEffect, useMemo } from 'react';
+import React, { useState, useCallback, useEffect, useMemo, lazy, Suspense } from 'react';
 import { ASCIIMazeCanvas } from './components/ASCIIMazeCanvas';
 import { HUDControls } from './components/HUDControls';
-import { PauseScreen } from './components/PauseScreen';
+// Neither the pause panel (1.8k lines) nor its icon set is needed for first
+// paint, so they load on first open instead of shipping in the entry chunk.
+const PauseScreen = lazy(() => import('./components/PauseScreen'));
 import { COLOR_THEMES, SPRITE_PACKS, generateNaturalWorld, playTerminalBeep } from './utils/sprites';
 import { setUse3DSpriteTrees } from './utils/treeModels';
-import { ColorTheme, WorldCell, MazeStats, CameraPreset, SpritePackType, PauseTab, RenderMetrics, DayNightState, LightType } from './types';
+import { ColorTheme, WorldCell, MazeStats, CameraPreset, SpritePackType, PauseTab, DayNightState, LightType } from './types';
 
 const SETTINGS_STORAGE_KEY = 'spritedung_user_settings_v1';
 
@@ -108,13 +110,6 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<PauseTab>('metrics');
   const [gameTimeSeconds, setGameTimeSeconds] = useState<number>(0);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
-  const [renderMetrics, setRenderMetrics] = useState<RenderMetrics>({
-    fps: 60,
-    drawCalls: 12,
-    triangles: 24500,
-    geometries: 18,
-    textures: 2,
-  });
 
   const handleToggle3DSpriteTrees = useCallback((enable: boolean) => {
     setUse3DSpriteTrees(enable);
@@ -244,32 +239,39 @@ export default function App() {
     setUse3DSpriteTreesState(true);
   }, []);
 
-  // Persist user settings to localStorage whenever they change
+  // Persist user settings to localStorage whenever they change.
+  // Debounced: `turnCount` and `timeOfDayMinutes` are in the dependency list, so
+  // every Space press used to serialise the whole settings object and write it
+  // synchronously on the main thread mid-turn.
   useEffect(() => {
-    try {
-      const settingsToSave: StoredUserSettings = {
-        themeId: theme.id,
-        spritePackId: spritePack,
-        translucencyRatio,
-        autoRotate,
-        cameraPreset,
-        isOrthographic,
-        soundEnabled,
-        crtEnabled,
-        isHeaderCollapsed,
-        isBottomCollapsed,
-        timeOfDayMinutes,
-        isTimeLocked,
-        manualTimeMinutes,
-        turnIncrementMinutes,
-        turnCount,
-        lightType,
-        use3DSpriteTrees: use3DSpriteTreesState,
-      };
-      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settingsToSave));
-    } catch (err) {
-      console.warn('Unable to save settings to localStorage:', err);
-    }
+    const timer = window.setTimeout(() => {
+      try {
+        const settingsToSave: StoredUserSettings = {
+          themeId: theme.id,
+          spritePackId: spritePack,
+          translucencyRatio,
+          autoRotate,
+          cameraPreset,
+          isOrthographic,
+          soundEnabled,
+          crtEnabled,
+          isHeaderCollapsed,
+          isBottomCollapsed,
+          timeOfDayMinutes,
+          isTimeLocked,
+          manualTimeMinutes,
+          turnIncrementMinutes,
+          turnCount,
+          lightType,
+          use3DSpriteTrees: use3DSpriteTreesState,
+        };
+        localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settingsToSave));
+      } catch (err) {
+        console.warn('Unable to save settings to localStorage:', err);
+      }
+    }, 400);
+
+    return () => window.clearTimeout(timer);
   }, [
     theme,
     spritePack,
@@ -310,10 +312,6 @@ export default function App() {
 
   const handleStatsChange = useCallback((newStats: MazeStats) => {
     setStats(newStats);
-  }, []);
-
-  const handleRenderMetricsChange = useCallback((metrics: RenderMetrics) => {
-    setRenderMetrics(metrics);
   }, []);
 
   // Stable identities for every toggle. App re-renders at least twice a second
@@ -371,7 +369,6 @@ export default function App() {
         isPaused={isPaused}
         dayNightState={dayNightState}
         onStatsChange={handleStatsChange}
-        onRenderMetricsChange={handleRenderMetricsChange}
       />
 
       {/* Cyberpunk HUD Controls */}
@@ -388,7 +385,6 @@ export default function App() {
         isHeaderCollapsed={isHeaderCollapsed}
         isBottomCollapsed={isBottomCollapsed}
         isFullscreen={isFullscreen}
-        fps={renderMetrics.fps}
         timeOfDayMinutes={timeOfDayMinutes}
         isTimeLocked={isTimeLocked}
         manualTimeMinutes={manualTimeMinutes}
@@ -414,13 +410,13 @@ export default function App() {
       />
 
       {/* Toggle Escape / Full Screen Pause Screen Modal */}
+      {isPaused && (
+      <Suspense fallback={null}>
       <PauseScreen
-        isOpen={isPaused}
         activeTab={activeTab}
         onTabChange={setActiveTab}
         onClose={handleClosePause}
         gameTimeSeconds={gameTimeSeconds}
-        metrics={renderMetrics}
         stats={stats}
         theme={theme}
         spritePack={spritePack}
@@ -459,6 +455,8 @@ export default function App() {
         onHeaderCollapseToggle={handleHeaderCollapseToggle}
         onResetSettings={handleResetSettings}
       />
+      </Suspense>
+      )}
     </div>
   );
 }

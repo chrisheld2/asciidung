@@ -1,7 +1,7 @@
 import React, { useEffect, useRef } from 'react';
+import { renderMetricsStore } from '../utils/renderMetricsStore';
 
 interface FPSCounterProps {
-  fps: number;
   themeColor?: string;
 }
 
@@ -47,107 +47,115 @@ const GLYPHS: ReadonlyArray<ReadonlyArray<number>> = [
 // Reusable integer buffer for glyph indices to prevent garbage collection
 const CHAR_BUFFER = new Int32Array(8);
 
-const FPSCounterComponent: React.FC<FPSCounterProps> = ({ fps, themeColor = '#22c55e' }) => {
+const FPSCounterComponent: React.FC<FPSCounterProps> = ({ themeColor = '#22c55e' }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const dotRef = useRef<HTMLSpanElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
 
-  const clampedFps = Math.min(999, Math.max(0, fps | 0));
-
+  // Subscribed directly to the metrics store and painted imperatively. Routing
+  // the frame counter through React state re-rendered every ancestor twice a
+  // second to change a handful of pixels.
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+    const draw = () => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
 
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
 
-    // Fill integer char buffer with glyph indices: e.g. [6, 0, 13, 10, 11, 12] for "60 FPS"
-    let len = 0;
-    if (clampedFps >= 100) {
-      CHAR_BUFFER[len++] = (clampedFps / 100) | 0;
-      CHAR_BUFFER[len++] = ((clampedFps % 100) / 10) | 0;
-      CHAR_BUFFER[len++] = (clampedFps % 10) | 0;
-    } else if (clampedFps >= 10) {
-      CHAR_BUFFER[len++] = (clampedFps / 10) | 0;
-      CHAR_BUFFER[len++] = (clampedFps % 10) | 0;
-    } else {
-      CHAR_BUFFER[len++] = clampedFps;
-    }
-    CHAR_BUFFER[len++] = 13; // ' '
-    CHAR_BUFFER[len++] = 10; // 'F'
-    CHAR_BUFFER[len++] = 11; // 'P'
-    CHAR_BUFFER[len++] = 12; // 'S'
+      const clampedFps = Math.min(999, Math.max(0, renderMetricsStore.get().fps | 0));
 
-    const dpr = window.devicePixelRatio || 1;
-    const cssWidth = 84;
-    const cssHeight = 22;
+      // Fill integer char buffer with glyph indices: e.g. [6, 0, 13, 10, 11, 12] for "60 FPS"
+      let len = 0;
+      if (clampedFps >= 100) {
+        CHAR_BUFFER[len++] = (clampedFps / 100) | 0;
+        CHAR_BUFFER[len++] = ((clampedFps % 100) / 10) | 0;
+        CHAR_BUFFER[len++] = (clampedFps % 10) | 0;
+      } else if (clampedFps >= 10) {
+        CHAR_BUFFER[len++] = (clampedFps / 10) | 0;
+        CHAR_BUFFER[len++] = (clampedFps % 10) | 0;
+      } else {
+        CHAR_BUFFER[len++] = clampedFps;
+      }
+      CHAR_BUFFER[len++] = 13; // ' '
+      CHAR_BUFFER[len++] = 10; // 'F'
+      CHAR_BUFFER[len++] = 11; // 'P'
+      CHAR_BUFFER[len++] = 12; // 'S'
 
-    if (canvas.width !== cssWidth * dpr || canvas.height !== cssHeight * dpr) {
-      canvas.width = cssWidth * dpr;
-      canvas.height = cssHeight * dpr;
-    }
+      const dpr = window.devicePixelRatio || 1;
+      const cssWidth = 84;
+      const cssHeight = 22;
 
-    ctx.save();
-    ctx.scale(dpr, dpr);
-    ctx.clearRect(0, 0, cssWidth, cssHeight);
+      if (canvas.width !== cssWidth * dpr || canvas.height !== cssHeight * dpr) {
+        canvas.width = cssWidth * dpr;
+        canvas.height = cssHeight * dpr;
+      }
 
-    // Select color based on performance thresholds
-    let color = themeColor;
-    if (clampedFps >= 50) {
-      color = '#22c55e'; // Emerald green
-    } else if (clampedFps >= 30) {
-      color = '#f59e0b'; // Amber
-    } else {
-      color = '#ef4444'; // Red
-    }
+      ctx.save();
+      ctx.scale(dpr, dpr);
+      ctx.clearRect(0, 0, cssWidth, cssHeight);
 
-    ctx.fillStyle = color;
+      // Select color based on performance thresholds
+      let color = themeColor;
+      if (clampedFps >= 50) {
+        color = '#22c55e'; // Emerald green
+      } else if (clampedFps >= 30) {
+        color = '#f59e0b'; // Amber
+      } else {
+        color = '#ef4444'; // Red
+      }
 
-    // Draw pixel font characters
-    const pixelSize = 2;
-    const charWidth = 5 * pixelSize; // 10px per char
-    const charHeight = 7 * pixelSize; // 14px high
-    const charGap = 2; // 2px spacing between chars
+      ctx.fillStyle = color;
 
-    const totalWidth = len * charWidth + (len - 1) * charGap;
-    const startX = Math.floor((cssWidth - totalWidth) / 2);
-    const startY = Math.floor((cssHeight - charHeight) / 2);
+      // Draw pixel font characters
+      const pixelSize = 2;
+      const charWidth = 5 * pixelSize; // 10px per char
+      const charHeight = 7 * pixelSize; // 14px high
+      const charGap = 2; // 2px spacing between chars
 
-    for (let i = 0; i < len; i++) {
-      const glyphIdx = CHAR_BUFFER[i];
-      const glyph = GLYPHS[glyphIdx];
-      const charX = startX + i * (charWidth + charGap);
+      const totalWidth = len * charWidth + (len - 1) * charGap;
+      const startX = Math.floor((cssWidth - totalWidth) / 2);
+      const startY = Math.floor((cssHeight - charHeight) / 2);
 
-      for (let row = 0; row < 7; row++) {
-        const bits = glyph[row];
-        for (let col = 0; col < 5; col++) {
-          if ((bits & (1 << (4 - col))) !== 0) {
-            ctx.fillRect(charX + col * pixelSize, startY + row * pixelSize, pixelSize, pixelSize);
+      for (let i = 0; i < len; i++) {
+        const glyphIdx = CHAR_BUFFER[i];
+        const glyph = GLYPHS[glyphIdx];
+        const charX = startX + i * (charWidth + charGap);
+
+        for (let row = 0; row < 7; row++) {
+          const bits = glyph[row];
+          for (let col = 0; col < 5; col++) {
+            if ((bits & (1 << (4 - col))) !== 0) {
+              ctx.fillRect(charX + col * pixelSize, startY + row * pixelSize, pixelSize, pixelSize);
+            }
           }
         }
       }
-    }
 
-    ctx.restore();
-  }, [clampedFps, themeColor]);
+      ctx.restore();
 
-  const titleString = PREALLOCATED_TITLE_STRINGS[clampedFps];
+      const dot = dotRef.current;
+      if (dot) {
+        dot.style.backgroundColor = color;
+        dot.style.boxShadow = `0 0 6px ${color}`;
+      }
+      if (rootRef.current) {
+        rootRef.current.title = PREALLOCATED_TITLE_STRINGS[clampedFps];
+      }
+    };
+
+    draw();
+    return renderMetricsStore.subscribe(draw);
+  }, [themeColor]);
 
   return (
     <div
+      ref={rootRef}
       className="flex items-center gap-1.5 px-2 py-1 rounded bg-black/80 border border-zinc-800 shadow-inner"
-      title={titleString}
+      title={PREALLOCATED_TITLE_STRINGS[60]}
     >
-      <span
-        className="w-2 h-2 rounded-full animate-pulse"
-        style={{
-          backgroundColor: clampedFps >= 50 ? '#22c55e' : clampedFps >= 30 ? '#f59e0b' : '#ef4444',
-          boxShadow: `0 0 6px ${clampedFps >= 50 ? '#22c55e' : clampedFps >= 30 ? '#f59e0b' : '#ef4444'}`,
-        }}
-      />
-      <canvas
-        ref={canvasRef}
-        style={{ width: '84px', height: '22px' }}
-        className="block"
-      />
+      <span ref={dotRef} className="w-2 h-2 rounded-full animate-pulse" />
+      <canvas ref={canvasRef} style={{ width: '84px', height: '22px' }} className="block" />
     </div>
   );
 };

@@ -1,8 +1,8 @@
-import React, { useState } from 'react';
+import React, { useState, lazy, Suspense } from 'react';
 import { ColorTheme, MazeStats, CameraPreset, SpritePackType } from '../types';
-import { COLOR_THEMES, SPRITE_PACKS, SPRITE_DEFS, generateStandaloneHTML, playTerminalBeep } from '../utils/sprites';
+import { COLOR_THEMES, SPRITE_PACKS, SPRITE_DEFS, playTerminalBeep } from '../utils/sprites';
 import { FPSCounter } from './FPSCounter';
-import { SpriteAtlasModal } from './SpriteAtlasModal';
+const SpriteAtlasModal = lazy(() => import('./SpriteAtlasModal'));
 import {
   RefreshCw,
   Palette,
@@ -74,7 +74,6 @@ interface HUDControlsProps {
   isHeaderCollapsed: boolean;
   isBottomCollapsed?: boolean;
   isFullscreen?: boolean;
-  fps?: number;
 
   // Day/Night Turn State
   timeOfDayMinutes: number;
@@ -116,7 +115,6 @@ const HUDControlsComponent: React.FC<HUDControlsProps> = ({
   isHeaderCollapsed,
   isBottomCollapsed: propIsBottomCollapsed,
   isFullscreen = false,
-  fps = 60,
   timeOfDayMinutes,
   isTimeLocked,
   manualTimeMinutes,
@@ -175,8 +173,9 @@ const HUDControlsComponent: React.FC<HUDControlsProps> = ({
     onSpritePackChange(nextPack.id);
   };
 
-  const handleDownloadSingleFile = () => {
+  const handleDownloadSingleFile = async () => {
     if (soundEnabled) playTerminalBeep(1500, 0.08);
+    const { generateStandaloneHTML } = await import('../utils/standaloneExport');
     const htmlContent = generateStandaloneHTML();
     const blob = new Blob([htmlContent], { type: 'text/html' });
     const url = URL.createObjectURL(blob);
@@ -277,7 +276,7 @@ const HUDControlsComponent: React.FC<HUDControlsProps> = ({
         {/* Top Right Quick Controls */}
         <div className="pointer-events-auto flex items-center gap-2 bg-black/90 p-2 rounded-md border border-zinc-800 backdrop-blur-md">
           {/* Accurate FPS Counter with zero string allocations */}
-          <FPSCounter fps={fps} themeColor={theme.fg} />
+          <FPSCounter themeColor={theme.fg} />
 
           {/* Pause / Settings Button */}
           <button
@@ -341,14 +340,18 @@ const HUDControlsComponent: React.FC<HUDControlsProps> = ({
       </div>
 
       {/* Interactive 8x8 Tile Atlas Inspection Modal */}
-      <SpriteAtlasModal
-        isOpen={showAtlasModal}
-        onClose={() => setShowAtlasModal(false)}
-        theme={theme}
-        activeSpritePack={spritePack}
-        onSpritePackChange={onSpritePackChange}
-        soundEnabled={soundEnabled}
-      />
+      {showAtlasModal && (
+        <Suspense fallback={null}>
+          <SpriteAtlasModal
+            isOpen={showAtlasModal}
+            onClose={() => setShowAtlasModal(false)}
+            theme={theme}
+            activeSpritePack={spritePack}
+            onSpritePackChange={onSpritePackChange}
+            soundEnabled={soundEnabled}
+          />
+        </Suspense>
+      )}
     </div>
   );
 };

@@ -1,6 +1,7 @@
-import React, { useState, useMemo, useEffect } from 'react';
-import { PauseTab, ColorTheme, MazeStats, CameraPreset, SpritePackType, RenderMetrics, LightType } from '../types';
-import { COLOR_THEMES, SPRITE_PACKS, playTerminalBeep, generateStandaloneHTML } from '../utils/sprites';
+import React, { useState, useMemo, useEffect, useSyncExternalStore } from 'react';
+import { PauseTab, ColorTheme, MazeStats, CameraPreset, SpritePackType, LightType } from '../types';
+import { renderMetricsStore } from '../utils/renderMetricsStore';
+import { COLOR_THEMES, SPRITE_PACKS, playTerminalBeep } from '../utils/sprites';
 import { formatInGameTime } from './HUDControls';
 import { Play, Pause, Maximize2, Minimize2, ChartBar as BarChart2, Palette, Camera, Volume2, VolumeX, Sparkles, RefreshCw, RotateCw, Box, Focus, Download, Grid2x2 as Grid, Clock, Activity, Cpu, X, FileSliders as Sliders, Layers, Trash2, Monitor, Check, ShieldAlert, Flame, TreePine, Mountain, Waves, Castle, KeyRound, Compass, Sun, Moon, Lock, Clock as Unlock, FastForward, Zap, Lightbulb, Search } from 'lucide-react';
 
@@ -343,12 +344,10 @@ const SearchedTooltip: React.FC<SearchedTooltipProps> = ({
 };
 
 interface PauseScreenProps {
-  isOpen: boolean;
   activeTab: PauseTab;
   onTabChange: (tab: PauseTab) => void;
   onClose: () => void;
   gameTimeSeconds: number;
-  metrics: RenderMetrics;
   stats: MazeStats;
   theme: ColorTheme;
   spritePack: SpritePackType;
@@ -404,12 +403,10 @@ function formatTime(seconds: number): string {
 }
 
 const PauseScreenComponent: React.FC<PauseScreenProps> = ({
-  isOpen,
   activeTab,
   onTabChange,
   onClose,
   gameTimeSeconds,
-  metrics,
   stats,
   theme,
   spritePack,
@@ -448,7 +445,11 @@ const PauseScreenComponent: React.FC<PauseScreenProps> = ({
   onHeaderCollapseToggle,
   onResetSettings,
 }) => {
-  if (!isOpen) return null;
+  // Mounted only while paused (see App), so every hook below runs
+  // unconditionally. They used to sit after an `if (!isOpen) return null`,
+  // which changed the hook count between renders - React reported this as
+  // "Expected static flag was missing".
+  const metrics = useSyncExternalStore(renderMetricsStore.subscribe, renderMetricsStore.get);
 
   const [searchQuery, setSearchQuery] = useState('');
   const [isSearchOpen, setIsSearchOpen] = useState(false);
@@ -495,8 +496,9 @@ const PauseScreenComponent: React.FC<PauseScreenProps> = ({
     onTabChange(tab);
   };
 
-  const handleDownload = () => {
+  const handleDownload = async () => {
     if (soundEnabled) playTerminalBeep(1400, 0.06);
+    const { generateStandaloneHTML } = await import('../utils/standaloneExport');
     const htmlContent = generateStandaloneHTML();
     const blob = new Blob([htmlContent], { type: 'text/html' });
     const url = URL.createObjectURL(blob);
@@ -1796,3 +1798,5 @@ const PauseScreenComponent: React.FC<PauseScreenProps> = ({
 };
 
 export const PauseScreen = React.memo(PauseScreenComponent);
+
+export default PauseScreen;
