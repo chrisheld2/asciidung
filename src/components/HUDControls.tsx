@@ -103,7 +103,7 @@ interface HUDControlsProps {
   onCrtToggle: () => void;
 }
 
-export const HUDControls: React.FC<HUDControlsProps> = ({
+const HUDControlsComponent: React.FC<HUDControlsProps> = ({
   stats,
   theme,
   spritePack,
@@ -352,3 +352,8 @@ export const HUDControls: React.FC<HUDControlsProps> = ({
     </div>
   );
 };
+
+// App re-renders on the metrics and play-clock ticks. Memoising here keeps
+// those from reconciling the whole HUD tree, now that every callback prop has a
+// stable identity.
+export const HUDControls = React.memo(HUDControlsComponent);

@@ -63,13 +63,20 @@ const saveCameraStateImmediate = (tileRenderer: TileRenderer | null, isOrthograp
 
   if (isValidCameraState(state)) {
     try {
-      const serializedState = JSON.stringify(state);
-      // The periodic checkpoint also runs while the camera is idle. Avoid
-      // rewriting storage when the camera state has not changed.
-      if (localStorage.getItem(CAMERA_STORAGE_KEY) === serializedState) {
+      // The periodic checkpoint also runs while the camera is idle. Compare a
+      // numeric fingerprint rather than reading storage back and comparing the
+      // serialised string, which ran on every idle tick.
+      const fingerprint =
+        persp.position.x * 1 + persp.position.y * 3 + persp.position.z * 7 +
+        ortho.position.x * 11 + ortho.position.y * 13 + ortho.position.z * 17 +
+        target.x * 19 + target.y * 23 + target.z * 29 +
+        (ortho.zoom || 1) * 31 + (isOrthographic ? 37 : 0);
+
+      if (fingerprint === lastSavedFingerprint) {
         return false;
       }
-      localStorage.setItem(CAMERA_STORAGE_KEY, serializedState);
+      lastSavedFingerprint = fingerprint;
+      localStorage.setItem(CAMERA_STORAGE_KEY, JSON.stringify(state));
       return true;
     } catch {
       // Ignore storage errors
@@ -78,21 +85,25 @@ const saveCameraStateImmediate = (tileRenderer: TileRenderer | null, isOrthograp
   return false;
 };
 
+let lastSavedFingerprint = Number.NaN;
+
 let saveTimer: number | null = null;
 const scheduleSaveCameraState = (
   tileRenderer: TileRenderer | null,
   isOrthographic: boolean,
   onSaved?: () => void
 ) => {
-  if (saveTimer !== null) {
-  window.clearTimeout(saveTimer);
-  }
+  // Throttle rather than debounce. OrbitControls fires 'change' every frame
+  // while auto-rotating, and resetting the timer each time meant a
+  // clearTimeout/setTimeout pair 60 times a second that never actually fired.
+  if (saveTimer !== null) return;
+
   saveTimer = window.setTimeout(() => {
     saveTimer = null;
     if (saveCameraStateImmediate(tileRenderer, isOrthographic)) {
       onSaved?.();
     }
-  }, 100);
+  }, 400);
 };
 
 const loadSavedCameraState = (): SavedCameraState | null => {
@@ -230,6 +241,11 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
   useEffect(() => {
     dayNightStateRef.current = dayNightState;
   }, [dayNightState]);
+
+  const themeRef = useRef(theme);
+  useEffect(() => {
+    themeRef.current = theme;
+  }, [theme]);
 
   const lightTypeRef = useRef(lightType);
   useEffect(() => {
@@ -422,6 +438,10 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
     return () => {
       saveCameraStateImmediate(tileRenderer, isOrthographicRef.current);
       window.clearInterval(cameraSaveInterval);
+      if (saveTimer !== null) {
+        window.clearTimeout(saveTimer);
+        saveTimer = null;
+      }
       if (cameraSaveToastTimerRef.current !== null) {
         window.clearTimeout(cameraSaveToastTimerRef.current);
       }
@@ -447,9 +467,9 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
     if (!tileRenderer) return;
 
     const tileEngine = tileEngineRef.current;
-    tileEngine.loadWorldGrid(worldGrid, translucencyRatio);
+    tileEngine.loadWorldGrid(worldGrid);
 
-    tileRenderer.buildWorld(tileEngine, worldGrid, spritePack, theme);
+    tileRenderer.buildWorld(tileEngine, worldGrid, spritePack, themeRef.current);
 
     const activeCam = isOrthographic ? tileRenderer.orthoCamera : tileRenderer.perspCamera;
     tileRenderer.activeCamera = activeCam;
@@ -483,7 +503,15 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
       prevStatsJsonRef.current = statsJson;
       onStatsChange(tileEngine.stats);
     }
-  }, [worldGrid, theme, spritePack, translucencyRatio]);
+    // Only the grid and the sprite pack change geometry or materials. Theme is a
+    // light-colour swap (handled below) and translucencyRatio does not reach the
+    // renderer at all - rebuilding the world for either was pure cost.
+  }, [worldGrid, spritePack]);
+
+  // Theme changes are just light colours, so they never rebuild the world.
+  useEffect(() => {
+    rendererInstanceRef.current?.applyTheme(theme);
+  }, [theme]);
 
   // Orthographic / Perspective camera toggle
   useEffect(() => {

@@ -38,9 +38,17 @@ export class FrustumCuller {
     rows: number,
     centerX: number,
     centerZ: number,
-    maxHeight = 40
+    maxHeight = 6
   ): SpatialChunk[] {
     this.chunks = [];
+
+    // Chunk size scales with the world so the chunk count stays bounded.
+    // Every chunk costs at least one draw call per content type it holds, so a
+    // fixed 16-tile chunk turns a large map into hundreds of tiny batches. The
+    // 64-tile floor means the default world is a single chunk - the whole map
+    // is on screen at once there, so subdividing it only splits batches without
+    // ever culling anything.
+    this.chunkSize = Math.max(64, Math.ceil(Math.max(cols, rows) / 4));
 
     const numChunksX = Math.ceil(cols / this.chunkSize);
     const numChunksZ = Math.ceil(rows / this.chunkSize);
@@ -59,8 +67,11 @@ export class FrustumCuller {
         const maxX = endC - centerX - 0.5 + paddingMargin;
         const minZ = startR - centerZ - 0.5 - paddingMargin;
         const maxZ = endR - centerZ - 0.5 + paddingMargin;
-        const minY = -100.0;
-        const maxY = 250.0;
+        // Bounds have to hug the actual content. A chunk 350 units tall for
+        // 6 units of trees is inside the frustum from almost any angle, so it
+        // never culls.
+        const minY = -2.0;
+        const maxY = maxHeight;
 
         const bounds = new THREE.Box3(
           new THREE.Vector3(minX, minY, minZ),

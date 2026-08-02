@@ -403,7 +403,7 @@ function formatTime(seconds: number): string {
   return `${pad(mins)}:${pad(secs)}`;
 }
 
-export const PauseScreen: React.FC<PauseScreenProps> = ({
+const PauseScreenComponent: React.FC<PauseScreenProps> = ({
   isOpen,
   activeTab,
   onTabChange,
@@ -1794,3 +1794,5 @@ export const PauseScreen: React.FC<PauseScreenProps> = ({
     </div>
   );
 };
+
+export const PauseScreen = React.memo(PauseScreenComponent);

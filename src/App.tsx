@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useMemo } from 'react';
 import { ASCIIMazeCanvas } from './components/ASCIIMazeCanvas';
 import { HUDControls } from './components/HUDControls';
 import { PauseScreen } from './components/PauseScreen';
@@ -316,13 +316,30 @@ export default function App() {
     setRenderMetrics(metrics);
   }, []);
 
-  const dayNightState: DayNightState = {
-    timeOfDayMinutes,
-    isTimeLocked,
-    manualTimeMinutes,
-    turnIncrementMinutes,
-    turnCount,
-  };
+  // Stable identities for every toggle. App re-renders at least twice a second
+  // (metrics and the play clock), and inline arrows would hand memoised children
+  // fresh props on each of those renders, defeating the memo entirely.
+  const handlePauseToggle = useCallback(() => setIsPaused((prev) => !prev), []);
+  const handleClosePause = useCallback(() => setIsPaused(false), []);
+  const handleHeaderCollapseToggle = useCallback(() => setIsHeaderCollapsed((prev) => !prev), []);
+  const handleBottomCollapseToggle = useCallback(() => setIsBottomCollapsed((prev) => !prev), []);
+  const handleAutoRotateToggle = useCallback(() => setAutoRotate((prev) => !prev), []);
+  const handleOrthographicToggle = useCallback(() => setIsOrthographic((prev) => !prev), []);
+  const handleSoundToggle = useCallback(() => setSoundEnabled((prev) => !prev), []);
+  const handleCrtToggle = useCallback(() => setCrtEnabled((prev) => !prev), []);
+
+  // Rebuilt only when the time actually changes, so the ref-sync effect in
+  // ASCIIMazeCanvas stops re-running on every unrelated App render.
+  const dayNightState: DayNightState = useMemo(
+    () => ({
+      timeOfDayMinutes,
+      isTimeLocked,
+      manualTimeMinutes,
+      turnIncrementMinutes,
+      turnCount,
+    }),
+    [timeOfDayMinutes, isTimeLocked, manualTimeMinutes, turnIncrementMinutes, turnCount]
+  );
 
   return (
     <div className="fixed inset-0 w-full h-full overflow-hidden bg-black select-none font-mono">
@@ -380,20 +397,20 @@ export default function App() {
         onAdvanceTurn={handleAdvanceTurn}
         onToggleTimeLock={handleToggleTimeLock}
         onTimeOfDayChange={handleTimeOfDayChange}
-        onPauseToggle={() => setIsPaused((prev) => !prev)}
+        onPauseToggle={handlePauseToggle}
         onFullscreenToggle={handleFullscreenToggle}
-        onHeaderCollapseToggle={() => setIsHeaderCollapsed((prev) => !prev)}
-        onBottomCollapseToggle={() => setIsBottomCollapsed((prev) => !prev)}
+        onHeaderCollapseToggle={handleHeaderCollapseToggle}
+        onBottomCollapseToggle={handleBottomCollapseToggle}
         onThemeChange={setTheme}
         onSpritePackChange={setSpritePack}
         onRegenerateMaze={handleRegenerateWorld}
         onTranslucencyChange={setTranslucencyRatio}
-        onAutoRotateToggle={() => setAutoRotate((prev) => !prev)}
+        onAutoRotateToggle={handleAutoRotateToggle}
         onCameraPresetChange={setCameraPreset}
-        onOrthographicToggle={() => setIsOrthographic((prev) => !prev)}
+        onOrthographicToggle={handleOrthographicToggle}
         onCenterCamera={handleCenterCamera}
-        onSoundToggle={() => setSoundEnabled((prev) => !prev)}
-        onCrtToggle={() => setCrtEnabled((prev) => !prev)}
+        onSoundToggle={handleSoundToggle}
+        onCrtToggle={handleCrtToggle}
       />
 
       {/* Toggle Escape / Full Screen Pause Screen Modal */}
@@ -401,7 +418,7 @@ export default function App() {
         isOpen={isPaused}
         activeTab={activeTab}
         onTabChange={setActiveTab}
-        onClose={() => setIsPaused(false)}
+        onClose={handleClosePause}
         gameTimeSeconds={gameTimeSeconds}
         metrics={renderMetrics}
         stats={stats}
@@ -430,16 +447,16 @@ export default function App() {
         onSpritePackChange={setSpritePack}
         onRegenerateWorld={handleRegenerateWorld}
         onTranslucencyChange={setTranslucencyRatio}
-        onAutoRotateToggle={() => setAutoRotate((prev) => !prev)}
+        onAutoRotateToggle={handleAutoRotateToggle}
         onCameraPresetChange={setCameraPreset}
-        onOrthographicToggle={() => setIsOrthographic((prev) => !prev)}
+        onOrthographicToggle={handleOrthographicToggle}
         onCenterCamera={handleCenterCamera}
-        onSoundToggle={() => setSoundEnabled((prev) => !prev)}
-        onCrtToggle={() => setCrtEnabled((prev) => !prev)}
+        onSoundToggle={handleSoundToggle}
+        onCrtToggle={handleCrtToggle}
         onLightTypeChange={setLightType}
         onToggle3DSpriteTrees={handleToggle3DSpriteTrees}
         onFullscreenToggle={handleFullscreenToggle}
-        onHeaderCollapseToggle={() => setIsHeaderCollapsed((prev) => !prev)}
+        onHeaderCollapseToggle={handleHeaderCollapseToggle}
         onResetSettings={handleResetSettings}
       />
     </div>

@@ -27,5 +27,18 @@ export default defineConfig(() => {
       host: '0.0.0.0',
       port,
     },
+    build: {
+      rollupOptions: {
+        output: {
+          // Split the engine out of app code. Three.js is the bulk of the
+          // bundle and changes only on upgrades, so editing game code no longer
+          // invalidates it in the browser cache.
+          manualChunks: {
+            three: ['three'],
+            react: ['react', 'react-dom'],
+          },
+        },
+      },
+    },
   };
 });

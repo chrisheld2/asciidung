@@ -57,8 +57,6 @@ export class TileDataEngine {
   public blockTypeIds: Uint8Array;
   public spriteIndices: Uint8Array;
   public heights: Float32Array;
-  public isRuinFlags: Uint8Array;
-  public isTranslucentFlags: Uint8Array;
 
   public emitters: LightEmitter[];
   public stats: MazeStats;
@@ -71,8 +69,6 @@ export class TileDataEngine {
     this.blockTypeIds = new Uint8Array(this.totalCells);
     this.spriteIndices = new Uint8Array(this.totalCells);
     this.heights = new Float32Array(this.totalCells);
-    this.isRuinFlags = new Uint8Array(this.totalCells);
-    this.isTranslucentFlags = new Uint8Array(this.totalCells);
 
     this.emitters = [];
     this.stats = {
@@ -99,7 +95,7 @@ export class TileDataEngine {
   /**
    * Load state from WorldCell[][] into flat typed array buffers
    */
-  public loadWorldGrid(worldGrid: WorldCell[][], translucencyRatio = 0.18): void {
+  public loadWorldGrid(worldGrid: WorldCell[][]): void {
     const rows = worldGrid.length;
     const cols = worldGrid[0]?.length || 0;
 
@@ -110,14 +106,11 @@ export class TileDataEngine {
       this.blockTypeIds = new Uint8Array(this.totalCells);
       this.spriteIndices = new Uint8Array(this.totalCells);
       this.heights = new Float32Array(this.totalCells);
-      this.isRuinFlags = new Uint8Array(this.totalCells);
-      this.isTranslucentFlags = new Uint8Array(this.totalCells);
     }
 
     this.emitters = [];
 
     let totalBlocks = 0;
-    let translucentWalls = 0;
     let treeCount = 0;
     let dirtCount = 0;
     let waterCount = 0;
@@ -146,13 +139,6 @@ export class TileDataEngine {
         this.blockTypeIds[idx] = blockTypeIdx;
         this.spriteIndices[idx] = cell.spriteIndex ?? (SPRITE_DEFS[cell.type]?.spriteIndex || 0);
         this.heights[idx] = cell.height ?? 0.1;
-
-        const isRuin = cell.isRuin ? 1 : 0;
-        this.isRuinFlags[idx] = isRuin;
-
-        const isTranslucent = isRuin === 1 && Math.random() < translucencyRatio ? 1 : 0;
-        this.isTranslucentFlags[idx] = isTranslucent;
-        if (isTranslucent === 1) translucentWalls++;
 
         const posX = c - centerX;
         const posZ = r - centerZ;
@@ -199,8 +185,12 @@ export class TileDataEngine {
       rows,
       cols,
       totalBlocks,
-      translucentWalls,
-      opaqueWalls: totalBlocks - translucentWalls,
+      // Wall translucency is not implemented in the renderer, so no wall is
+      // currently translucent. This used to be a per-rebuild Math.random() roll
+      // whose result nothing ever read - it broke seed reproducibility and
+      // reported a count that did not correspond to anything on screen.
+      translucentWalls: 0,
+      opaqueWalls: totalBlocks,
       treeCount,
       dirtCount,
       waterCount,

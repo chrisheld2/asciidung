@@ -9,51 +9,56 @@ export function isMountainCell(cell: WorldCell | undefined): boolean {
 }
 
 interface MountainCluster {
-  cells: Set<string>; // 'r,c' keys
+  cells: Set<number>; // r * cols + c
   cellList: Array<{ r: number; c: number; cell: WorldCell }>;
 }
 
-// Group contiguous mountain cells into connected clusters using 4-directional BFS
+/**
+ * Group contiguous mountain cells into connected clusters using 4-directional BFS.
+ *
+ * Keys are integers rather than `r,c` strings, and the frontier is a typed ring
+ * buffer rather than an array with shift(). The previous version allocated two
+ * strings per cell visit and paid O(n) per dequeue, which made this quadratic in
+ * the number of mountain tiles.
+ */
 export function findMountainClusters(grid: WorldCell[][]): MountainCluster[] {
   const rows = grid.length;
   const cols = grid[0].length;
-  const visited = new Set<string>();
+  const total = rows * cols;
+  const visited = new Uint8Array(total);
+  const queue = new Int32Array(total);
   const clusters: MountainCluster[] = [];
 
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
-      const key = `${r},${c}`;
-      if (visited.has(key) || !isMountainCell(grid[r][c])) {
+      const start = r * cols + c;
+      if (visited[start] || !isMountainCell(grid[r][c])) {
         continue;
       }
 
-      // Start BFS for new mountain cluster
-      const clusterCells = new Set<string>();
+      const clusterCells = new Set<number>();
       const cellList: Array<{ r: number; c: number; cell: WorldCell }> = [];
-      const queue: Array<[number, number]> = [[r, c]];
-      visited.add(key);
+      let head = 0;
+      let tail = 0;
+      queue[tail++] = start;
+      visited[start] = 1;
 
-      while (queue.length > 0) {
-        const [currR, currC] = queue.shift()!;
-        const currKey = `${currR},${currC}`;
-        clusterCells.add(currKey);
+      while (head < tail) {
+        const current = queue[head++];
+        const currR = (current / cols) | 0;
+        const currC = current - currR * cols;
+        clusterCells.add(current);
         cellList.push({ r: currR, c: currC, cell: grid[currR][currC] });
 
-        // Check 4 neighbors
-        const neighbors: Array<[number, number]> = [
-          [currR - 1, currC],
-          [currR + 1, currC],
-          [currR, currC - 1],
-          [currR, currC + 1],
-        ];
+        for (let n = 0; n < 4; n++) {
+          const nr = currR + (n === 0 ? -1 : n === 1 ? 1 : 0);
+          const nc = currC + (n === 2 ? -1 : n === 3 ? 1 : 0);
+          if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) continue;
 
-        for (const [nr, nc] of neighbors) {
-          if (nr >= 0 && nr < rows && nc >= 0 && nc < cols) {
-            const nKey = `${nr},${nc}`;
-            if (!visited.has(nKey) && isMountainCell(grid[nr][nc])) {
-              visited.add(nKey);
-              queue.push([nr, nc]);
-            }
+          const nKey = nr * cols + nc;
+          if (!visited[nKey] && isMountainCell(grid[nr][nc])) {
+            visited[nKey] = 1;
+            queue[tail++] = nKey;
           }
         }
       }
@@ -113,20 +118,36 @@ function getMountainHeightAt(
   return Math.max(0.1, baseH + noiseDisplacement);
 }
 
-// Calculate color based on vertex height, slope, and active sprite pack palette
+interface MountainPalette {
+  rgbBase: [number, number, number];
+  rgbRock: [number, number, number];
+  rgbHighlight: [number, number, number];
+  rgbPeakSnow: [number, number, number];
+}
+
+// Resolve the pack palette once per build. This used to run a SPRITE_PACKS
+// lookup and four hex parses for every vertex of every triangle.
+function getMountainPalette(packId: SpritePackType): MountainPalette {
+  const pack = SPRITE_PACKS.find((p) => p.id === packId) || SPRITE_PACKS[0];
+  const colors = pack.colors;
+  return {
+    rgbBase: hexToRGB(colors.r2 || '#334155'), // Dark slate / base
+    rgbRock: hexToRGB(colors.r1 || '#64748b'), // Mid rock grey
+    rgbHighlight: hexToRGB(colors.r3 || '#cbd5e1'), // Snowcap / light peak
+    rgbPeakSnow: [1, 1, 1], // Pure white snowcaps
+  };
+}
+
+// Calculate color based on vertex height, slope, and active sprite pack palette.
+// Writes into `out` so the per-vertex hot path allocates nothing.
 function getLowPolyMountainColor(
   height: number,
   maxHeight: number,
   normalY: number,
-  packId: SpritePackType
+  palette: MountainPalette,
+  out: [number, number, number]
 ): [number, number, number] {
-  const pack = SPRITE_PACKS.find((p) => p.id === packId) || SPRITE_PACKS[0];
-  const colors = pack.colors;
-
-  const rgbBase = hexToRGB(colors.r2 || '#334155'); // Dark slate / base
-  const rgbRock = hexToRGB(colors.r1 || '#64748b'); // Mid rock grey
-  const rgbHighlight = hexToRGB(colors.r3 || '#cbd5e1'); // Snowcap / light peak
-  const rgbPeakSnow = hexToRGB('#ffffff'); // Pure white snowcaps
+  const { rgbBase, rgbRock, rgbHighlight, rgbPeakSnow } = palette;
 
   // Height ratio between 0 and 1
   const hRatio = Math.min(1, Math.max(0, height / (maxHeight || 4.5)));
@@ -159,11 +180,11 @@ function getLowPolyMountainColor(
 
   // Add subtle color jitter per facet for enhanced low-poly depth
   const jitter = (Math.sin(height * 12.3 + normalY * 17.1) * 0.04);
-  r = Math.min(1, Math.max(0, r + jitter));
-  g = Math.min(1, Math.max(0, g + jitter));
-  b = Math.min(1, Math.max(0, b + jitter));
+  out[0] = Math.min(1, Math.max(0, r + jitter));
+  out[1] = Math.min(1, Math.max(0, g + jitter));
+  out[2] = Math.min(1, Math.max(0, b + jitter));
 
-  return [r, g, b];
+  return out;
 }
 
 /**
@@ -190,6 +211,38 @@ export function buildUnifiedMountainMeshGroup(
   const positions: number[] = [];
   const colors: number[] = [];
   const normals: number[] = [];
+
+  const palette = getMountainPalette(packId);
+  // Scratch colour tuples, reused for every triangle.
+  const col1: [number, number, number] = [0, 0, 0];
+  const col2: [number, number, number] = [0, 0, 0];
+  const col3: [number, number, number] = [0, 0, 0];
+
+  // Emit one flat-shaded triangle. Explicit pushes rather than spreads: the
+  // spread form allocated an iterator per vertex, three times per triangle.
+  const pushTriangle = (
+    p1: [number, number, number],
+    p2: [number, number, number],
+    p3: [number, number, number],
+    maxH: number
+  ) => {
+    const ax = p2[0] - p1[0], ay = p2[1] - p1[1], az = p2[2] - p1[2];
+    const bx = p3[0] - p1[0], by = p3[1] - p1[1], bz = p3[2] - p1[2];
+
+    let nx = ay * bz - az * by;
+    let ny = az * bx - ax * bz;
+    let nz = ax * by - ay * bx;
+    const len = Math.hypot(nx, ny, nz) || 1;
+    nx /= len; ny /= len; nz /= len;
+
+    getLowPolyMountainColor(p1[1], maxH, ny, palette, col1);
+    getLowPolyMountainColor(p2[1], maxH, ny, palette, col2);
+    getLowPolyMountainColor(p3[1], maxH, ny, palette, col3);
+
+    positions.push(p1[0], p1[1], p1[2], p2[0], p2[1], p2[2], p3[0], p3[1], p3[2]);
+    normals.push(nx, ny, nz, nx, ny, nz, nx, ny, nz);
+    colors.push(col1[0], col1[1], col1[2], col2[0], col2[1], col2[2], col3[0], col3[1], col3[2]);
+  };
 
   // Vertex position cache helper to ensure continuous vertex coordinates on grid junctions
   function getVertexPos(x: number, z: number): [number, number, number] {
@@ -243,28 +296,8 @@ export function buildUnifiedMountainMeshGroup(
         [v01, vCenter, v00],
       ];
 
-      topTriangles.forEach(([p1, p2, p3]) => {
-        // Calculate flat triangle face normal
-        const ax = p2[0] - p1[0], ay = p2[1] - p1[1], az = p2[2] - p1[2];
-        const bx = p3[0] - p1[0], by = p3[1] - p1[1], bz = p3[2] - p1[2];
-
-        let nx = ay * bz - az * by;
-        let ny = az * bx - ax * bz;
-        let nz = ax * by - ay * bx;
-        const len = Math.hypot(nx, ny, nz) || 1;
-        nx /= len; ny /= len; nz /= len;
-
-        const maxH = cell.type === 'mountain_high' ? 5.2 : 3.5;
-
-        // Apply height/slope color gradient for each vertex
-        const col1 = getLowPolyMountainColor(p1[1], maxH, ny, packId);
-        const col2 = getLowPolyMountainColor(p2[1], maxH, ny, packId);
-        const col3 = getLowPolyMountainColor(p3[1], maxH, ny, packId);
-
-        positions.push(...p1, ...p2, ...p3);
-        normals.push(nx, ny, nz, nx, ny, nz, nx, ny, nz);
-        colors.push(...col1, ...col2, ...col3);
-      });
+      const maxH = cell.type === 'mountain_high' ? 5.2 : 3.5;
+      topTriangles.forEach(([p1, p2, p3]) => pushTriangle(p1, p2, p3, maxH));
 
       // Outer boundary side skirts (ONLY generated if adjacent cell is NOT a mountain tile)
       const neighbors = [
@@ -277,39 +310,19 @@ export function buildUnifiedMountainMeshGroup(
       neighbors.forEach(({ dr, dc, pA, pB }) => {
         const nr = r + dr;
         const nc = c + dc;
-        const neighborKey = `${nr},${nc}`;
+        const inCluster =
+          nr >= 0 && nr < rows && nc >= 0 && nc < cols && cluster.cells.has(nr * cols + nc);
 
         // Generate outer boundary side skirt if neighbor is NOT in mountain cluster
-        if (!cluster.cells.has(neighborKey)) {
+        if (!inCluster) {
           const groundY = -0.5;
 
           const pA_base: [number, number, number] = [pA[0], groundY, pA[2]];
           const pB_base: [number, number, number] = [pB[0], groundY, pB[2]];
 
           // CCW triangles facing outward away from mountain center
-          const sideTriangles: Array<[[number, number, number], [number, number, number], [number, number, number]]> = [
-            [pA, pB, pB_base],
-            [pA, pB_base, pA_base],
-          ];
-
-          sideTriangles.forEach(([p1, p2, p3]) => {
-            const ax = p2[0] - p1[0], ay = p2[1] - p1[1], az = p2[2] - p1[2];
-            const bx = p3[0] - p1[0], by = p3[1] - p1[1], bz = p3[2] - p1[2];
-
-            let nx = ay * bz - az * by;
-            let ny = az * bx - ax * bz;
-            let nz = ax * by - ay * bx;
-            const len = Math.hypot(nx, ny, nz) || 1;
-            nx /= len; ny /= len; nz /= len;
-
-            const col1 = getLowPolyMountainColor(p1[1], 4.5, ny, packId);
-            const col2 = getLowPolyMountainColor(p2[1], 4.5, ny, packId);
-            const col3 = getLowPolyMountainColor(p3[1], 4.5, ny, packId);
-
-            positions.push(...p1, ...p2, ...p3);
-            normals.push(nx, ny, nz, nx, ny, nz, nx, ny, nz);
-            colors.push(...col1, ...col2, ...col3);
-          });
+          pushTriangle(pA, pB, pB_base, 4.5);
+          pushTriangle(pA, pB_base, pA_base, 4.5);
         }
       });
     });

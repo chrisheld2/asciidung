@@ -47,13 +47,18 @@ Three core rendering modules in `src/rendering/`:
   - Maze statistics tracking (tile counts, water, trees, etc.)
   - Light emitter management for day/night lighting
 
-- **`TilePoolManager.ts`** - Object pooling for memory efficiency:
-  - Reuses THREE.InstancedMesh geometries and materials
-  - Manages batch rendering of similar tiles
-  - Reduces garbage collection pressure during render loops
+- **`TilePoolManager.ts`** - Shared GPU resource cache (singleton, ref-counted):
+  - Caches geometry templates, materials, atlas textures and tree models across rebuilds
+  - `get*` returns SHARED resources - never mutate them or attach per-world instance
+    attributes to them (that orphans a GPU buffer on every rebuild)
+  - `create*` returns geometry the caller owns and must dispose
+  - Does not pool InstancedMesh objects: their `instanceMatrix` is sized to the exact
+    instance count, so a recycled mesh would need reallocating anyway
 
 - **`FrustumCuller.ts`** - Visibility culling:
   - Frustum-based visibility checks to skip off-screen geometry
+  - Chunk size scales with world size (min 64) so chunk count stays bounded; every
+    chunk costs at least one draw call per content type it holds
 
 ### UI Components
 
@@ -98,20 +103,41 @@ Three core rendering modules in `src/rendering/`:
 
 2. **Frustum Culling** - FrustumCuller filters out-of-view tiles before rendering.
 
-3. **Object Pooling** - TilePoolManager recycles THREE.InstancedMesh to reduce mesh creation overhead.
+3. **Shared Resource Cache** - TilePoolManager caches geometry, materials and textures across world rebuilds.
 
-4. **Instanced Rendering** - Batches identical tiles into single draw call via THREE.InstancedMesh.
+4. **Instanced Rendering** - Batches identical tiles into single draw call via THREE.InstancedMesh. The
+   default 64x64 world renders in ~10 draw calls; treat a rise in `renderer.info.render.calls` as a regression.
 
 5. **3D vs. 2D Trees** - `use3DSpriteTrees` setting allows toggling expensive 3D tree geometry for performance tuning.
+
+6. **Alpha cutout, never alpha blend** - Foliage materials must keep `transparent: false` with `alphaTest`
+   set. `transparent: true` combined with `side: DoubleSide` makes Three.js draw every mesh twice and
+   disables early-Z; it previously accounted for 55 of 115 draw calls.
+
+7. **Split terrain batches** - Ground tiles whose four neighbours are at least as tall render as a 2-triangle
+   top quad (`BatchedTerrainFlat`); only tiles with an exposed side use the 12-triangle box (`BatchedTerrainSolid`).
+
+8. **Per-instance colour needs `instanceColor`, not `vertexColors`** - `vertexColors: true` makes the shader
+   multiply by a `color` VERTEX attribute; on geometry without one WebGL supplies (0,0,0) and everything
+   renders black. `setColorAt` works on its own.
+
+9. **World size is dynamic** - Nothing in `TileRenderer` may assume 64x64. Buffers size from
+   `tileEngine.rows/cols`, and `mesh.count` must never exceed `instanceMatrix.count`.
+
+10. **Rebuild only for geometry changes** - `buildWorld()` is a synchronous full rebuild (~12 ms at 64x64).
+    Theme changes go through `applyTheme()`; only `worldGrid` and `spritePack` should trigger a rebuild.
 
 ## Development Notes
 
 - **Environment Variables**:
-  - `GEMINI_API_KEY` - Required for Gemini API calls (set in `.env.local`)
   - `PORT` - Overrides default 3000 port
   - `DISABLE_HMR` - Set to `'true'` to disable file watching (used in AI Studio)
 
 - **Settings Persistence**: User preferences stored in localStorage under `spritedung_user_settings_v1` and `spritedung_camera_position_v3` keys. Settings include camera position per projection mode, theme, sprite pack, time state, etc.
+
+- **Assets**: `public/` is shipped to the browser verbatim - only put runtime-sized assets there.
+  Source masters live in `art/` and are excluded from the build. The adventurer billboard renders
+  ~30 px on screen, so its runtime texture is 256x256, not the 1254x1254 master.
 
 - **Styling**: Tailwind CSS v4 via `@tailwindcss/vite` plugin. Base styles in `src/index.css`.
 

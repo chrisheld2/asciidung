@@ -1,11 +1,32 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { ColorTheme, CameraPreset, SpritePackType, RenderMetrics, DayNightState, LightEmitter, LightType } from '../types';
-import { TileDataEngine } from './TileData';
+import { TileDataEngine, BLOCK_TYPE_TO_INDEX } from './TileData';
 import { TilePoolManager } from './TilePoolManager';
 import { FrustumCuller } from './FrustumCuller';
 import { buildUnifiedMountainMeshGroup } from '../utils/mountainMesh';
 import { SPRITE_DEFS } from '../utils/sprites';
+
+// Integer block ids, resolved once. The build loop runs per tile, so comparing
+// numbers beats the string prefix tests it used to do.
+const BLOCK_ID_EMPTY = 255;
+const BLOCK_ID_TREE_OAK = BLOCK_TYPE_TO_INDEX.tree_oak;
+const BLOCK_ID_TREE_PINE = BLOCK_TYPE_TO_INDEX.tree_pine;
+const BLOCK_ID_BUSH = BLOCK_TYPE_TO_INDEX.bush;
+const BLOCK_ID_MUSHROOM = BLOCK_TYPE_TO_INDEX.mushroom;
+const BLOCK_ID_MOUNTAIN_LOW = BLOCK_TYPE_TO_INDEX.mountain_low;
+const BLOCK_ID_MOUNTAIN_HIGH = BLOCK_TYPE_TO_INDEX.mountain_high;
+const BLOCK_ID_ROCK = BLOCK_TYPE_TO_INDEX.rock;
+
+// Ground slab drawn beneath foliage tiles.
+const FOLIAGE_GROUND_HEIGHT = 0.1;
+
+// Emitters considered by the fake-lighting mode, nearest first.
+const MAX_FAKE_LIGHT_EMITTERS = 24;
+
+// Exponential rate for the day/night sun interpolation, in units of 1/second.
+// -ln(1 - 0.08) * 60 reproduces the old per-frame 0.08 lerp at 60 FPS.
+const DAY_NIGHT_LERP_RATE = 5.0;
 
 // MODULE-SCOPED SCRATCHPAD OBJECTS FOR ZERO-ALLOCATION RENDER LOOP
 const _tempVec3_1 = new THREE.Vector3();
@@ -27,6 +48,13 @@ const _rightVec = new THREE.Vector3();
 const _upVec = new THREE.Vector3();
 const _forwardVec = new THREE.Vector3();
 const _panDeltaVec = new THREE.Vector3();
+
+// Reused across pointer picks so a moving cursor allocates nothing.
+const _raycastTargets: THREE.Object3D[] = [];
+const _raycastHits: THREE.Intersection[] = [];
+
+// Hoisted so sorting the emitter list does not allocate a closure per call.
+const byDistanceSq = (a: LightEmitter, b: LightEmitter) => (a.distSq || 0) - (b.distSq || 0);
 
 interface TreeInstanceData {
   x: number;
@@ -91,9 +119,31 @@ export class TileRenderer {
   public fakeLightGroup: THREE.Group;
   public fakeLightSourcesMesh: THREE.InstancedMesh;
   public lightTintMesh: THREE.InstancedMesh;
-  private tileHeights: Float32Array = new Float32Array(4096);
+  private tintGeometry: THREE.BufferGeometry;
+  private tintMaterial: THREE.Material;
+  private tileHeights: Float32Array = new Float32Array(0);
+  private tintAttenuation: Float32Array = new Float32Array(0);
   private lastLightType: LightType = 'realtime';
-  private fakeLightFrameCount = 0;
+
+  // World dimensions, mirrored from the tile engine on every build. Nothing in
+  // this class may assume 64x64: the data engine resizes for any world, and
+  // hardcoding the old default silently truncated buffers and left instanced
+  // draws reading past the end of their attributes.
+  private rows = 0;
+  private cols = 0;
+  private centerX = 0;
+  private centerZ = 0;
+
+  // Geometry this renderer owns for the current world and must dispose on
+  // rebuild. Shared cache resources are deliberately excluded.
+  private ownedGeometries: THREE.BufferGeometry[] = [];
+  private adventurerMaterial: THREE.SpriteMaterial | null = null;
+
+  // Latest pointer position, resolved to a world hit once per frame rather than
+  // once per pointer event.
+  private pendingPointerX = 0;
+  private pendingPointerY = 0;
+  private hasPendingPointer = false;
 
   // Light update dirty checking
   private lastTargetX = NaN;
@@ -105,7 +155,8 @@ export class TileRenderer {
 
   constructor(container: HTMLDivElement, isOrthographic = true, theme: ColorTheme) {
     this.poolManager = TilePoolManager.getInstance();
-    this.frustumCuller = new FrustumCuller(16);
+    this.poolManager.retain();
+    this.frustumCuller = new FrustumCuller(64);
 
     // 1. Scene
     this.scene = new THREE.Scene();
@@ -222,29 +273,44 @@ export class TileRenderer {
     this.scene.add(this.worldGroup);
 
     // The player is a camera-facing 2D billboard, kept as a texture so it can
-    // sit naturally among the 3D dungeon blocks.
+    // sit naturally among the 3D dungeon blocks. Nearest magnification keeps the
+    // pixels crisp; mipmaps stop it shimmering when the camera zooms out (safe
+    // here, unlike the tile atlas, because this texture holds a single sprite
+    // with nothing adjacent to bleed into).
     this.adventurerTexture = new THREE.TextureLoader().load('/assets/sprites/adventurer-2d.png');
     this.adventurerTexture.colorSpace = THREE.SRGBColorSpace;
+    this.adventurerTexture.magFilter = THREE.NearestFilter;
+    this.adventurerTexture.minFilter = THREE.NearestMipmapLinearFilter;
+    this.adventurerTexture.generateMipmaps = true;
 
     // 7. Fake Light Mode Visual Objects (Glowing Light Sources & Distance Light Tint)
     const sourceGeo = new THREE.OctahedronGeometry(0.35, 1);
-    const sourceMat = new THREE.MeshBasicMaterial({
-      vertexColors: true,
-    });
+    // No `vertexColors` here. It makes the shader multiply by a `color` VERTEX
+    // attribute, which this geometry does not have - WebGL then supplies
+    // (0, 0, 0) and everything renders black. Per-instance colours come from
+    // setColorAt/instanceColor, which Three.js wires up independently.
+    const sourceMat = new THREE.MeshBasicMaterial({});
     this.fakeLightSourcesMesh = new THREE.InstancedMesh(sourceGeo, sourceMat, 256);
     this.fakeLightSourcesMesh.frustumCulled = false;
 
-    const tintGeo = new THREE.PlaneGeometry(1.001, 1.001);
-    tintGeo.rotateX(-Math.PI / 2);
-    const tintMat = new THREE.MeshBasicMaterial({
+    this.tintGeometry = new THREE.PlaneGeometry(1.001, 1.001);
+    this.tintGeometry.rotateX(-Math.PI / 2);
+    this.tintMaterial = new THREE.MeshBasicMaterial({
       color: 0xffffff,
-      vertexColors: true,
+      // Same as above: per-tile colour arrives via instanceColor. Setting
+      // vertexColors made this whole layer render black, which is why fake
+      // lighting mode showed nothing but silhouettes.
       transparent: true,
       opacity: 0.9,
       depthWrite: false,
-      side: THREE.DoubleSide,
+      // These quads always face up and are only ever viewed from above, so
+      // back faces are pure wasted fill on an already blended full-map layer.
+      side: THREE.FrontSide,
     });
-    this.lightTintMesh = new THREE.InstancedMesh(tintGeo, tintMat, 4096);
+    // Sized to the real tile count on every build. A fixed 4096 capacity meant
+    // that any world larger than 64x64 issued an instanced draw for more
+    // instances than the matrix buffer held.
+    this.lightTintMesh = new THREE.InstancedMesh(this.tintGeometry, this.tintMaterial, 1);
     this.lightTintMesh.frustumCulled = false;
 
     this.fakeLightGroup = new THREE.Group();
@@ -255,48 +321,66 @@ export class TileRenderer {
   }
 
   /**
-   * Cast the screen-space pointer through the active camera and place the
-   * cursor light just above the first piece of world geometry it hits.
+   * Record the pointer position. The raycast itself is deferred to the next
+   * frame: pointer events arrive at 60-120+ Hz, and picking against every
+   * terrain and foliage instance costs about a millisecond each time. Resolving
+   * once per rendered frame gives an identical result - the light can only move
+   * once per frame anyway - for a fraction of the work.
    */
   public updateMouseLightFromPointer(clientX: number, clientY: number): void {
-    const bounds = this.renderer.domElement.getBoundingClientRect();
-    if (bounds.width <= 0 || bounds.height <= 0) return;
-
-    _mouseNdc.set(
-      ((clientX - bounds.left) / bounds.width) * 2 - 1,
-      -((clientY - bounds.top) / bounds.height) * 2 + 1
-    );
-
-    this.activeCamera.updateMatrixWorld(true);
-    this.worldGroup.updateMatrixWorld(true);
-    this.floorMesh?.updateMatrixWorld(true);
-    _mouseRaycaster.setFromCamera(_mouseNdc, this.activeCamera);
-
-    const targets: THREE.Object3D[] = this.floorMesh
-      ? [this.worldGroup, this.floorMesh]
-      : [this.worldGroup];
-    const hit = _mouseRaycaster.intersectObjects(targets, true)[0];
-
-    if (!hit) {
-      this.mouseLightActive = false;
-      this.mouseLight.visible = false;
-      return;
-    }
-
-    _mouseLightHit.copy(hit.point);
-    _mouseLightHit.y += 1.25;
-    this.mouseLight.position.copy(_mouseLightHit);
-    this.mouseLightActive = true;
-    this.mouseLight.visible = this.lightType === 'realtime';
+    this.pendingPointerX = clientX;
+    this.pendingPointerY = clientY;
+    this.hasPendingPointer = true;
   }
 
   public hideMouseLight(): void {
+    this.hasPendingPointer = false;
     this.mouseLightActive = false;
     this.mouseLight.visible = false;
   }
 
   /**
-   * Rebuild whole 64x64 scene with InstancedMesh groups & GPU offloading
+   * Cast the most recent pointer position through the active camera and place
+   * the cursor light just above the first piece of world geometry it hits.
+   */
+  private resolvePointerLight(): void {
+    if (!this.hasPendingPointer) return;
+    this.hasPendingPointer = false;
+
+    const bounds = this.renderer.domElement.getBoundingClientRect();
+    if (bounds.width <= 0 || bounds.height <= 0) return;
+
+    _mouseNdc.set(
+      ((this.pendingPointerX - bounds.left) / bounds.width) * 2 - 1,
+      -((this.pendingPointerY - bounds.top) / bounds.height) * 2 + 1
+    );
+
+    // Matrices are already current: updateFrame refreshes them before this runs.
+    _mouseRaycaster.setFromCamera(_mouseNdc, this.activeCamera);
+
+    _raycastTargets.length = 0;
+    _raycastTargets.push(this.worldGroup);
+    if (this.floorMesh) _raycastTargets.push(this.floorMesh);
+
+    _raycastHits.length = 0;
+    _mouseRaycaster.intersectObjects(_raycastTargets, true, _raycastHits);
+
+    if (_raycastHits.length === 0) {
+      this.mouseLightActive = false;
+      this.mouseLight.visible = false;
+      return;
+    }
+
+    _mouseLightHit.copy(_raycastHits[0].point);
+    _mouseLightHit.y += 1.25;
+    this.mouseLight.position.copy(_mouseLightHit);
+    this.mouseLightActive = true;
+    this.mouseLight.visible = this.lightType === 'realtime';
+    _raycastHits.length = 0;
+  }
+
+  /**
+   * Rebuild the whole scene as InstancedMesh batches, for a world of any size.
    */
   public buildWorld(
     tileEngine: TileDataEngine,
@@ -304,6 +388,18 @@ export class TileRenderer {
     spritePack: SpritePackType,
     theme: ColorTheme
   ): void {
+    // Geometry created for the previous world. Shared cache resources are not
+    // in here and must not be disposed.
+    for (let i = 0; i < this.ownedGeometries.length; i++) {
+      this.ownedGeometries[i].dispose();
+    }
+    this.ownedGeometries.length = 0;
+
+    if (this.adventurerMaterial) {
+      this.adventurerMaterial.dispose();
+      this.adventurerMaterial = null;
+    }
+
     // Clear previous world meshes safely and dispose of GPU InstancedMesh buffers
     while (this.worldGroup.children.length > 0) {
       const child = this.worldGroup.children.pop();
@@ -322,8 +418,6 @@ export class TileRenderer {
                 obj.material.dispose();
               }
             }
-          } else if (obj instanceof THREE.Sprite && obj.material) {
-            obj.material.dispose();
           }
         });
         child.clear();
@@ -342,11 +436,17 @@ export class TileRenderer {
     const centerX = cols / 2 - 0.5;
     const centerZ = rows / 2 - 0.5;
 
+    this.rows = rows;
+    this.cols = cols;
+    this.centerX = centerX;
+    this.centerZ = centerZ;
+
     // 1. Base Ground Plane
     const floorGeo = new THREE.PlaneGeometry(cols + 10, rows + 10);
     const floorMat = this.poolManager.getOpaqueSideMaterial();
     this.floorMesh = new THREE.Mesh(floorGeo, floorMat);
     this.floorMesh.frustumCulled = false;
+    this.floorMesh.receiveShadow = true;
     this.floorMesh.rotation.x = -Math.PI / 2;
     this.floorMesh.position.set(0, -0.5, 0);
     this.scene.add(this.floorMesh);
@@ -359,7 +459,11 @@ export class TileRenderer {
       this.worldGroup.add(chunk.group);
     });
 
-    const terrainInstances: TerrainInstanceData[] = [];
+    // Ground tiles whose four neighbours are at least as tall have completely
+    // hidden sides and only need their top face. Splitting them off drops those
+    // tiles from 12 triangles to 2.
+    const flatInstances: TerrainInstanceData[] = [];
+    const solidInstances: TerrainInstanceData[] = [];
     const treeInstancesByChunk = chunks.map(() => ({
       oak: [] as TreeInstanceData[],
       pine: [] as TreeInstanceData[],
@@ -368,27 +472,69 @@ export class TileRenderer {
     }));
     const chunksPerRow = Math.ceil(cols / this.frustumCuller.chunkSize);
 
+    // Height of the surface a neighbouring tile presents, used to decide whether
+    // this tile's sides can be seen. Integer block ids avoid the per-tile string
+    // comparisons this loop used to do.
+    const surfaceHeightAt = (r: number, c: number): number => {
+      if (r < 0 || r >= rows || c < 0 || c >= cols) return -Infinity; // map edge: sides exposed
+      const i = r * cols + c;
+      const id = tileEngine.blockTypeIds[i];
+      if (id === BLOCK_ID_EMPTY) return -Infinity;
+      if (id === BLOCK_ID_MOUNTAIN_LOW || id === BLOCK_ID_MOUNTAIN_HIGH || id === BLOCK_ID_ROCK) {
+        return Infinity; // the unified mountain mesh skirts down to the floor
+      }
+      if (
+        id === BLOCK_ID_TREE_OAK ||
+        id === BLOCK_ID_TREE_PINE ||
+        id === BLOCK_ID_BUSH ||
+        id === BLOCK_ID_MUSHROOM
+      ) {
+        return FOLIAGE_GROUND_HEIGHT;
+      }
+      return tileEngine.heights[i];
+    };
+
+    const pushTerrainInstance = (r: number, c: number, height: number, spriteIndex: number) => {
+      const instance: TerrainInstanceData = {
+        x: c - centerX,
+        y: height / 2 - 0.5,
+        z: r - centerZ,
+        height,
+        spriteIndex,
+      };
+
+      const exposed =
+        surfaceHeightAt(r - 1, c) < height - 1e-4 ||
+        surfaceHeightAt(r + 1, c) < height - 1e-4 ||
+        surfaceHeightAt(r, c - 1) < height - 1e-4 ||
+        surfaceHeightAt(r, c + 1) < height - 1e-4;
+
+      if (exposed) solidInstances.push(instance);
+      else flatInstances.push(instance);
+    };
+
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
         const idx = tileEngine.getIndex(r, c);
-        if (tileEngine.blockTypeIds[idx] === 255) continue;
+        const blockId = tileEngine.blockTypeIds[idx];
+        if (blockId === BLOCK_ID_EMPTY) continue;
 
         const cell = worldGrid[r][c];
         if (!cell) continue;
 
-        const posX = c - centerX;
-        const posZ = r - centerZ;
-        const isTree = cell.type === 'tree_oak' || cell.type === 'tree_pine' || cell.type === 'bush';
-        const isMushroom = cell.type === 'mushroom';
+        const isTree =
+          blockId === BLOCK_ID_TREE_OAK ||
+          blockId === BLOCK_ID_TREE_PINE ||
+          blockId === BLOCK_ID_BUSH;
+        const isMushroom = blockId === BLOCK_ID_MUSHROOM;
 
         if (isTree || isMushroom) {
-          terrainInstances.push({
-            x: posX,
-            y: 0.1 / 2 - 0.5,
-            z: posZ,
-            height: 0.1,
-            spriteIndex: cell.spriteIndex ?? SPRITE_DEFS.grass.spriteIndex,
-          });
+          pushTerrainInstance(
+            r,
+            c,
+            FOLIAGE_GROUND_HEIGHT,
+            cell.spriteIndex ?? SPRITE_DEFS.grass.spriteIndex
+          );
 
           const chunkX = Math.floor(c / this.frustumCuller.chunkSize);
           const chunkZ = Math.floor(r / this.frustumCuller.chunkSize);
@@ -398,69 +544,95 @@ export class TileRenderer {
           const rotY = pseudoRng * Math.PI * 2;
           const scaleVar = 0.85 + (pseudoRng % 0.3);
           const instance: TreeInstanceData = {
-            x: posX,
+            x: c - centerX,
             y: -0.45,
-            z: posZ,
+            z: r - centerZ,
             rotY,
             scaleX: scaleVar,
-            scaleY: cell.type === 'tree_pine' ? scaleVar * 1.15 : scaleVar,
+            scaleY: blockId === BLOCK_ID_TREE_PINE ? scaleVar * 1.15 : scaleVar,
             scaleZ: scaleVar,
           };
 
-          if (cell.type === 'tree_oak') treeChunk.oak.push(instance);
-          else if (cell.type === 'tree_pine') treeChunk.pine.push(instance);
-          else if (cell.type === 'bush') treeChunk.bush.push(instance);
+          if (blockId === BLOCK_ID_TREE_OAK) treeChunk.oak.push(instance);
+          else if (blockId === BLOCK_ID_TREE_PINE) treeChunk.pine.push(instance);
+          else if (blockId === BLOCK_ID_BUSH) treeChunk.bush.push(instance);
           else treeChunk.mushroom.push(instance);
           continue;
         }
 
-        if (cell.type.startsWith('mountain') || cell.type === 'rock') {
+        if (
+          blockId === BLOCK_ID_MOUNTAIN_LOW ||
+          blockId === BLOCK_ID_MOUNTAIN_HIGH ||
+          blockId === BLOCK_ID_ROCK
+        ) {
           continue; // Handled by the unified mountain mesh.
         }
 
-        const height = tileEngine.heights[idx];
-        terrainInstances.push({
-          x: posX,
-          y: height / 2 - 0.5,
-          z: posZ,
-          height,
-          spriteIndex: tileEngine.spriteIndices[idx],
-        });
+        pushTerrainInstance(r, c, tileEngine.heights[idx], tileEngine.spriteIndices[idx]);
       }
     }
 
-    if (terrainInstances.length > 0) {
-      const terrainGeometry = this.poolManager.getBatchedBlockGeometry();
-      const terrainMaterials = [
-        this.poolManager.getOpaqueSideMaterial(),
-        this.poolManager.getTopAtlasMaterial(spritePack),
-      ];
-      const terrainMesh = this.poolManager.acquireInstancedMesh(
-        terrainGeometry,
-        terrainMaterials,
-        terrainInstances.length
-      );
-      const spriteIndices = new Float32Array(terrainInstances.length);
+    const buildTerrainBatch = (
+      instances: TerrainInstanceData[],
+      geometry: THREE.BufferGeometry,
+      materials: THREE.Material | THREE.Material[],
+      name: string
+    ) => {
+      if (instances.length === 0) {
+        geometry.dispose();
+        return;
+      }
+
+      // The geometry is owned by this world, never the shared cache: attaching a
+      // per-world instance attribute to a cached geometry orphans the previous
+      // attribute's GPU buffer on every rebuild.
+      this.ownedGeometries.push(geometry);
+
+      const mesh = this.poolManager.createInstancedMesh(geometry, materials, instances.length);
+      const spriteIndices = new Float32Array(instances.length);
       _tempQuat_1.identity();
 
-      for (let i = 0; i < terrainInstances.length; i++) {
-        const instance = terrainInstances[i];
+      for (let i = 0; i < instances.length; i++) {
+        const instance = instances[i];
         _tempVec3_1.set(instance.x, instance.y, instance.z);
         _tempVec3_2.set(1, instance.height, 1);
         _tempMat4_1.compose(_tempVec3_1, _tempQuat_1, _tempVec3_2);
-        terrainMesh.setMatrixAt(i, _tempMat4_1);
+        mesh.setMatrixAt(i, _tempMat4_1);
         spriteIndices[i] = instance.spriteIndex;
       }
 
-      terrainGeometry.setAttribute(
+      geometry.setAttribute(
         'instanceSpriteIndex',
         new THREE.InstancedBufferAttribute(spriteIndices, 1).setUsage(THREE.StaticDrawUsage)
       );
-      terrainMesh.instanceMatrix.setUsage(THREE.StaticDrawUsage);
-      terrainMesh.instanceMatrix.needsUpdate = true;
-      terrainMesh.name = 'BatchedTerrain';
-      this.worldGroup.add(terrainMesh);
-    }
+      mesh.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+      mesh.instanceMatrix.needsUpdate = true;
+      mesh.receiveShadow = true;
+      // Bounds have to be computed across the instances, not just the unit
+      // geometry, for frustum culling to keep the batch on screen.
+      mesh.computeBoundingSphere();
+      mesh.computeBoundingBox();
+      mesh.name = name;
+      this.worldGroup.add(mesh);
+    };
+
+    const sideMaterial = this.poolManager.getOpaqueSideMaterial();
+    const topMaterial = this.poolManager.getTopAtlasMaterial(spritePack);
+
+    // Flat tiles need only the atlas-mapped top: one draw call, 2 triangles each.
+    buildTerrainBatch(
+      flatInstances,
+      this.poolManager.createTerrainTopQuadGeometry(),
+      topMaterial,
+      'BatchedTerrainFlat'
+    );
+    // Everything with a visible side keeps the full block: two draw calls.
+    buildTerrainBatch(
+      solidInstances,
+      this.poolManager.createTerrainBoxGeometry(),
+      [sideMaterial, topMaterial],
+      'BatchedTerrainSolid'
+    );
 
     chunks.forEach((chunk, chunkIndex) => {
       const treeInstances = treeInstancesByChunk[chunkIndex];
@@ -470,7 +642,7 @@ export class TileRenderer {
         if (instances.length === 0) return;
 
         const model = this.poolManager.getTreeModel(type, spritePack);
-        const mesh = this.poolManager.acquireInstancedMesh(model.geometry, model.materials, instances.length);
+        const mesh = this.poolManager.createInstancedMesh(model.geometry, model.materials, instances.length);
         mesh.castShadow = true;
         mesh.receiveShadow = false;
 
@@ -485,7 +657,10 @@ export class TileRenderer {
           mesh.setMatrixAt(i, _tempMat4_1);
         }
 
+        mesh.instanceMatrix.setUsage(THREE.StaticDrawUsage);
         mesh.instanceMatrix.needsUpdate = true;
+        mesh.computeBoundingSphere();
+        mesh.computeBoundingBox();
         chunk.group.add(mesh);
       };
 
@@ -525,14 +700,14 @@ export class TileRenderer {
       if (found) break;
     }
 
-    const adventurerMaterial = new THREE.SpriteMaterial({
+    this.adventurerMaterial = new THREE.SpriteMaterial({
       map: this.adventurerTexture,
       transparent: true,
       alphaTest: 0.08,
       depthWrite: false,
       depthTest: true,
     });
-    const adventurer = new THREE.Sprite(adventurerMaterial);
+    const adventurer = new THREE.Sprite(this.adventurerMaterial);
     adventurer.name = 'CenterDungeonAdventurer';
     adventurer.position.set(playerX, playerHeight + 0.68, playerZ);
     adventurer.scale.set(0.95, 1.35, 1);
@@ -544,51 +719,145 @@ export class TileRenderer {
     this.lastTargetZ = NaN;
     this.dirLight.shadow.needsUpdate = true;
 
-    // Populate tileHeights & pre-allocate lightTintMesh tile matrices
+    this.rebuildFakeLightTint(worldGrid);
+
+    this.centerLight.position.set(0, 20, 0);
+    this.applyTheme(theme);
+  }
+
+  /**
+   * Recolour the scene lights. Themes only affect light colours, so switching
+   * one must never rebuild the world.
+   */
+  public applyTheme(theme: ColorTheme): void {
+    this.centerLight.color.set(theme.light);
+    this.ambientLight.color.set(theme.ambient);
+    this.fillLight.color.set(theme.light);
+  }
+
+  /**
+   * Rebuild the fake-lighting tint layer for the current world.
+   *
+   * Both the per-tile transform and the per-tile colour are computed here, once
+   * per world, because both depend only on static data: tile height and emitter
+   * positions. This used to re-run the whole rows x cols x emitters loop every
+   * third frame and produce exactly the same numbers each time.
+   */
+  private rebuildFakeLightTint(worldGrid: any[][]): void {
+    const rows = this.rows;
+    const cols = this.cols;
+    const totalCells = rows * cols;
+
+    if (this.tileHeights.length < totalCells) {
+      this.tileHeights = new Float32Array(totalCells);
+    }
     this.tileHeights.fill(0);
+
+    // The instanced draw reads one matrix per instance, so capacity has to cover
+    // the world. Growing it means a new mesh; the geometry and material are
+    // shared with the old one and stay alive.
+    if (this.lightTintMesh.instanceMatrix.count < totalCells) {
+      this.fakeLightGroup.remove(this.lightTintMesh);
+      this.lightTintMesh.dispose();
+      this.lightTintMesh = new THREE.InstancedMesh(this.tintGeometry, this.tintMaterial, totalCells);
+      this.lightTintMesh.frustumCulled = false;
+      this.fakeLightGroup.add(this.lightTintMesh);
+    }
+
+    // Scatter each emitter over the tiles inside its radius, rather than having
+    // every tile test every emitter. That is O(emitters x radius^2) instead of
+    // O(tiles x emitters), so it can use ALL emitters instead of an arbitrary
+    // subset, and it stays fast on large worlds.
+    if (this.tintAttenuation.length < totalCells) {
+      this.tintAttenuation = new Float32Array(totalCells);
+    }
+    const attenuation = this.tintAttenuation;
+    attenuation.fill(0, 0, totalCells);
+
+    for (let i = 0; i < this.lightEmitters.length; i++) {
+      const e = this.lightEmitters[i];
+      const maxDist = e.distance || 16.0;
+      const invMaxDist = 1 / maxDist;
+
+      // Emitter position back to grid coordinates
+      const gridC = e.x + this.centerX;
+      const gridR = e.z + this.centerZ;
+      const minC = Math.max(0, Math.ceil(gridC - maxDist));
+      const maxC = Math.min(cols - 1, Math.floor(gridC + maxDist));
+      const minR = Math.max(0, Math.ceil(gridR - maxDist));
+      const maxR = Math.min(rows - 1, Math.floor(gridR + maxDist));
+
+      for (let r = minR; r <= maxR; r++) {
+        const dz = r - gridR;
+        const dzSq = dz * dz;
+        const rowBase = r * cols;
+        for (let c = minC; c <= maxC; c++) {
+          const dx = c - gridC;
+          const dSq = dx * dx + dzSq;
+          if (dSq >= maxDist * maxDist) continue;
+          const att = 1.0 - Math.sqrt(dSq) * invMaxDist;
+          const idx = rowBase + c;
+          if (att > attenuation[idx]) attenuation[idx] = att;
+        }
+      }
+    }
 
     let tintIdx = 0;
     _tempQuat_1.identity();
+    _tempVec3_2.set(1.001, 1.0, 1.001);
 
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
-        const idx = r * 64 + c;
+        const idx = r * cols + c;
         const cell = worldGrid[r]?.[c];
         const tileH = cell ? cell.height || 0 : 0;
         this.tileHeights[idx] = tileH;
 
-        const worldX = c - 31.5;
-        const worldZ = r - 31.5;
+        const worldX = c - this.centerX;
+        const worldZ = r - this.centerZ;
         _tempVec3_1.set(worldX, tileH + 0.02, worldZ);
-        _tempVec3_2.set(1.001, 1.0, 1.001);
         _tempMat4_1.compose(_tempVec3_1, _tempQuat_1, _tempVec3_2);
-        this.lightTintMesh.setMatrixAt(tintIdx++, _tempMat4_1);
+        this.lightTintMesh.setMatrixAt(tintIdx, _tempMat4_1);
+
+        const totalIntensity = Math.min(1.0, 0.3 + attenuation[idx] * 0.6);
+
+        if (totalIntensity > 0.82) {
+          _tempColor_1.setRGB(1.0, 0.98, 0.85);
+        } else if (totalIntensity > 0.6) {
+          _tempColor_1.setRGB(1.0, 0.82, 0.45);
+        } else if (totalIntensity > 0.42) {
+          _tempColor_1.setRGB(0.9, 0.65, 0.35);
+        } else {
+          _tempColor_1.setRGB(0.4, 0.48, 0.62);
+        }
+
+        const brightness = totalIntensity * 1.1;
+        _tempColor_1.r *= brightness;
+        _tempColor_1.g *= brightness;
+        _tempColor_1.b *= brightness;
+        this.lightTintMesh.setColorAt(tintIdx, _tempColor_1);
+
+        tintIdx++;
       }
     }
+
     this.lightTintMesh.count = tintIdx;
     this.lightTintMesh.instanceMatrix.needsUpdate = true;
-
-    if (this.centerLight) {
-      this.centerLight.position.set(0, 20, 0);
-      this.centerLight.color.set(theme.light);
-    }
-    if (this.ambientLight) {
-      this.ambientLight.color.set(theme.ambient);
+    if (this.lightTintMesh.instanceColor) {
+      this.lightTintMesh.instanceColor.needsUpdate = true;
     }
   }
 
   /**
-   * ZERO-ALLOCATION Fake Light Computation:
-   * - Renders visual fake light source meshes (glowing octahedrons/orbs at emitter & sun locations)
-   * - Calculates multi-tier simple color intensity gradients across all 64x64 tiles
-   * - Ambient light is OFF and no black shadow boxes are used
+   * Per-frame fake-light work: animate the glowing orbs that mark each emitter.
+   * The tile tint underneath them is static and is built in rebuildFakeLightTint.
    */
   private computeFakeLighting(): void {
     // 1. Render Visual Fake Light Source Meshes
     let sourceIdx = 0;
 
     // Emitters (Torches, Campfires, Chests, Portals)
-    const numEmitters = Math.min(24, this.lightEmitters.length);
+    const numEmitters = Math.min(MAX_FAKE_LIGHT_EMITTERS, this.lightEmitters.length);
     for (let i = 0; i < numEmitters; i++) {
       const e = this.lightEmitters[i];
       _tempVec3_1.set(e.x, e.y + 0.5, e.z);
@@ -607,66 +876,6 @@ export class TileRenderer {
     this.fakeLightSourcesMesh.instanceMatrix.needsUpdate = true;
     if (this.fakeLightSourcesMesh.instanceColor) {
       this.fakeLightSourcesMesh.instanceColor.needsUpdate = true;
-    }
-
-    // 2. Tile Light Intensity & Simple Color Gradients (Rate limited to every 3 frames for 60 FPS)
-    this.fakeLightFrameCount++;
-    if (this.fakeLightFrameCount % 3 !== 0) {
-      return;
-    }
-
-    let tintCount = 0;
-
-    for (let r = 0; r < 64; r++) {
-      for (let c = 0; c < 64; c++) {
-        const worldX = c - 31.5;
-        const worldZ = r - 31.5;
-
-        // Distance from closest light emitters
-        let maxEmitterAtt = 0;
-
-        for (let i = 0; i < numEmitters; i++) {
-          const e = this.lightEmitters[i];
-          const dxE = worldX - e.x;
-          const dzE = worldZ - e.z;
-          if (Math.abs(dxE) < 16 && Math.abs(dzE) < 16) {
-            const dESq = dxE * dxE + dzE * dzE;
-            const maxDist = e.distance || 16.0;
-            if (dESq < maxDist * maxDist) {
-              const att = Math.max(0, 1.0 - Math.sqrt(dESq) / maxDist);
-              if (att > maxEmitterAtt) {
-                maxEmitterAtt = att;
-              }
-            }
-          }
-        }
-
-        // Total fake illumination score (0.0 to 1.0)
-        const totalIntensity = Math.min(1.0, 0.3 + maxEmitterAtt * 0.6);
-
-        // Simple distinct colors at different intensity thresholds
-        if (totalIntensity > 0.82) {
-          _tempColor_1.setRGB(1.0, 0.98, 0.85);
-        } else if (totalIntensity > 0.60) {
-          _tempColor_1.setRGB(1.0, 0.82, 0.45);
-        } else if (totalIntensity > 0.42) {
-          _tempColor_1.setRGB(0.9, 0.65, 0.35);
-        } else {
-          _tempColor_1.setRGB(0.4, 0.48, 0.62);
-        }
-
-        // Brightness scaling
-        _tempColor_1.r *= totalIntensity * 1.1;
-        _tempColor_1.g *= totalIntensity * 1.1;
-        _tempColor_1.b *= totalIntensity * 1.1;
-
-        this.lightTintMesh.setColorAt(tintCount++, _tempColor_1);
-      }
-    }
-
-    this.lightTintMesh.count = tintCount;
-    if (this.lightTintMesh.instanceColor) {
-      this.lightTintMesh.instanceColor.needsUpdate = true;
     }
   }
 
@@ -808,7 +1017,11 @@ export class TileRenderer {
       if (diff > 720) diff -= 1440;
       if (diff < -720) diff += 1440;
 
-      this.currentVisualMinutes += diff * 0.08;
+      // Frame-rate independent approach. A fixed per-frame fraction made the sun
+      // move twice as fast at 120 FPS as at 60, so the simulation ran at a
+      // different speed on every machine. The rate constant is chosen to match
+      // the previous feel at 60 FPS (1 - 0.08 per 1/60 s).
+      this.currentVisualMinutes += diff * (1 - Math.exp(-DAY_NIGHT_LERP_RATE * delta));
       if (this.currentVisualMinutes < 0) this.currentVisualMinutes += 1440;
       if (this.currentVisualMinutes >= 1440) this.currentVisualMinutes -= 1440;
 
@@ -890,7 +1103,7 @@ export class TileRenderer {
             e.distSq = dx * dx + dz * dz;
           }
 
-          this.lightEmitters.sort((a, b) => (a.distSq || 0) - (b.distSq || 0));
+          this.lightEmitters.sort(byDistanceSq);
         }
 
         const nightFactor = sunY < 0 ? 2.2 : 1.0;
@@ -965,11 +1178,15 @@ export class TileRenderer {
 
     // 6. Force current frame matrices update for camera and world
     if (this.activeCamera) this.activeCamera.updateMatrixWorld();
+    this.worldGroup.updateMatrixWorld(true);
 
-    // 7. Frustum Culling using FRESH current-frame matrices
+    // 7. Resolve the pointer pick once per frame, against this frame's matrices
+    this.resolvePointerLight();
+
+    // 8. Frustum Culling using FRESH current-frame matrices
     this.frustumCuller.updateVisibility(this.activeCamera);
 
-    // 8. Render Scene
+    // 9. Render Scene
     this.renderer.render(this.scene, this.activeCamera);
   }
 
@@ -1032,7 +1249,47 @@ export class TileRenderer {
 
   public dispose(): void {
     this.controls.dispose();
-    this.poolManager.disposeAll();
+
+    // Everything this renderer allocated itself. Resources handed out by the
+    // shared cache are released separately, and only once the last renderer
+    // using them is gone.
+    for (let i = 0; i < this.ownedGeometries.length; i++) {
+      this.ownedGeometries[i].dispose();
+    }
+    this.ownedGeometries.length = 0;
+
+    this.adventurerMaterial?.dispose();
+    this.adventurerMaterial = null;
+    this.adventurerTexture.dispose();
+
+    this.worldGroup.traverse((obj) => {
+      if (obj instanceof THREE.InstancedMesh) {
+        obj.dispose();
+      }
+      if (obj instanceof THREE.Mesh && obj.parent?.name === 'UnifiedMountainMeshGroup') {
+        obj.geometry.dispose();
+        if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose());
+        else obj.material.dispose();
+      }
+    });
+    this.worldGroup.clear();
+
+    if (this.floorMesh) {
+      this.scene.remove(this.floorMesh);
+      this.floorMesh.geometry.dispose();
+      this.floorMesh = null;
+    }
+
+    this.lightTintMesh.dispose();
+    this.fakeLightSourcesMesh.dispose();
+    this.fakeLightSourcesMesh.geometry.dispose();
+    (this.fakeLightSourcesMesh.material as THREE.Material).dispose();
+    this.tintGeometry.dispose();
+    this.tintMaterial.dispose();
+
+    this.scene.clear();
+
+    this.poolManager.release();
     this.renderer.dispose();
     this.renderer.domElement.remove();
   }

@@ -5,7 +5,14 @@ import { createOakTreeModel, createPineTreeModel, createBushModel, createMushroo
 
 /**
  * TilePoolManager
- * Responsible for GPU object pooling, texture/material caching, and explicit resource lifecycle management.
+ * Shared cache for the GPU resources every world rebuild reuses: geometry
+ * templates, materials, atlas textures and tree models, plus explicit lifecycle
+ * management for them.
+ *
+ * Everything handed out by a `get*` method is SHARED and owned by this cache -
+ * callers must never mutate it (in particular, never attach per-world instance
+ * attributes to it; that orphans a GPU buffer on every rebuild). Use the
+ * `create*` methods when a caller needs geometry it can own and dispose.
  */
 export class TilePoolManager {
   private static instance: TilePoolManager | null = null;
@@ -20,17 +27,33 @@ export class TilePoolManager {
   // batch, so it adds no meshes or draw calls.
   private waterTimeUniform = { value: 0 };
 
-  // Shared InstancedMesh pool
-  private instancedMeshPool: THREE.InstancedMesh[] = [];
-
   // Tree model assets cache per sprite pack
   private treeModelCache = new Map<string, TreeModelAssets>();
+
+  // How many live renderers are using this shared cache. React Strict Mode
+  // mounts, tears down and remounts effects, so a single renderer's teardown
+  // must not dispose resources a second renderer is still holding.
+  private refCount = 0;
 
   public static getInstance(): TilePoolManager {
     if (!TilePoolManager.instance) {
       TilePoolManager.instance = new TilePoolManager();
     }
     return TilePoolManager.instance;
+  }
+
+  public retain(): void {
+    this.refCount++;
+  }
+
+  /**
+   * Drop one renderer's claim on the cache, disposing it once nobody is left.
+   */
+  public release(): void {
+    this.refCount = Math.max(0, this.refCount - 1);
+    if (this.refCount === 0) {
+      this.disposeAll();
+    }
   }
 
   /**
@@ -41,7 +64,7 @@ export class TilePoolManager {
    * side/bottom faces render in one call and the atlas-mapped top render in a second.
    * Per-instance matrices provide height and per-instance attributes select sprites.
    */
-  public getBatchedBlockGeometry(): THREE.BoxGeometry {
+  private getBatchedBlockTemplate(): THREE.BoxGeometry {
     const key = 'batched_block_unit_v1';
     if (this.geometryCache.has(key)) {
       return this.geometryCache.get(key) as THREE.BoxGeometry;
@@ -73,6 +96,63 @@ export class TilePoolManager {
 
     this.geometryCache.set(key, geo);
     return geo;
+  }
+
+  /**
+   * A unit block the caller OWNS. The terrain batch attaches a per-world
+   * `instanceSpriteIndex` attribute, so it needs its own geometry: attaching it
+   * to the shared template would orphan the previous attribute's GPU buffer on
+   * every rebuild, and the template is never disposed to reclaim it.
+   */
+  public createTerrainBoxGeometry(): THREE.BufferGeometry {
+    return this.getBatchedBlockTemplate().clone();
+  }
+
+  /**
+   * Just the atlas-mapped top face of the unit block, as an owned geometry.
+   *
+   * Ground tiles whose four neighbours are at least as tall have completely
+   * hidden sides, so they only need this quad: 2 triangles instead of the box's
+   * 12. The face is lifted straight out of the block template, so it keeps the
+   * exact same UVs and sits at the same height under the same instance matrix -
+   * flat and solid tiles can share one set of transforms.
+   */
+  public createTerrainTopQuadGeometry(): THREE.BufferGeometry {
+    const template = this.getBatchedBlockTemplate();
+    const index = template.index;
+    const topGroup = template.groups.find((g) => g.materialIndex === 1);
+    if (!index || !topGroup) {
+      throw new Error('Block template is missing its atlas-mapped top group');
+    }
+
+    const srcPos = template.attributes.position;
+    const srcNormal = template.attributes.normal;
+    const srcUv = template.attributes.uv;
+
+    const count = topGroup.count;
+    const positions = new Float32Array(count * 3);
+    const normals = new Float32Array(count * 3);
+    const uvs = new Float32Array(count * 2);
+
+    for (let i = 0; i < count; i++) {
+      const v = index.getX(topGroup.start + i);
+      positions[i * 3] = srcPos.getX(v);
+      positions[i * 3 + 1] = srcPos.getY(v);
+      positions[i * 3 + 2] = srcPos.getZ(v);
+      normals[i * 3] = srcNormal.getX(v);
+      normals[i * 3 + 1] = srcNormal.getY(v);
+      normals[i * 3 + 2] = srcNormal.getZ(v);
+      uvs[i * 2] = srcUv.getX(v);
+      uvs[i * 2 + 1] = srcUv.getY(v);
+    }
+
+    const quad = new THREE.BufferGeometry();
+    quad.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    quad.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+    quad.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+    quad.computeBoundingBox();
+    quad.computeBoundingSphere();
+    return quad;
   }
 
   /**
@@ -204,9 +284,14 @@ export class TilePoolManager {
   }
 
   /**
-   * Acquire or create an InstancedMesh container
+   * Build an InstancedMesh container with this renderer's defaults.
+   *
+   * Instanced meshes are not recycled between world rebuilds: their backing
+   * `instanceMatrix` is sized to the exact instance count, so a reused mesh
+   * would need reallocating anyway. Geometry, materials and textures - the
+   * genuinely expensive resources - are what this class caches.
    */
-  public acquireInstancedMesh(
+  public createInstancedMesh(
     geometry: THREE.BufferGeometry,
     material: THREE.Material | THREE.Material[],
     count: number
@@ -215,16 +300,7 @@ export class TilePoolManager {
     const mesh = new THREE.InstancedMesh(geometry, targetMat, count);
     mesh.castShadow = false;
     mesh.receiveShadow = false;
-    mesh.frustumCulled = false;
     return mesh;
-  }
-
-  /**
-   * Release an InstancedMesh to pool or dispose if unneeded
-   */
-  public releaseInstancedMesh(mesh: THREE.InstancedMesh): void {
-    mesh.removeFromParent();
-    mesh.count = 0;
   }
 
   /**
@@ -242,16 +318,6 @@ export class TilePoolManager {
       model.materials.forEach((m) => m.dispose());
     });
     this.treeModelCache.clear();
-
-    this.instancedMeshPool.forEach((mesh) => {
-      mesh.geometry.dispose();
-      if (Array.isArray(mesh.material)) {
-        mesh.material.forEach((m) => m.dispose());
-      } else {
-        mesh.material.dispose();
-      }
-    });
-    this.instancedMeshPool = [];
 
     clearSpriteAtlasCache();
   }

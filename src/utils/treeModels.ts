@@ -122,6 +122,13 @@ export function setUse3DSpriteTrees(enable: boolean) {
 // ============================================================================
 // LIGHTWEIGHT 3-D SPRITE TREE MODELS (MAXIMUM 4 SPRITES PER MODEL)
 // ============================================================================
+//
+// Foliage is alpha-CUTOUT, not alpha-blended: alphaTest gives the hard pixel
+// edge the art style wants. Keep `transparent: false` on every material here.
+// Setting it to true costs an extra full pass per mesh, because Three.js draws
+// double-sided transparent materials back faces first, and it also forfeits
+// early-Z and forces a back-to-front sort. Measured on the 64x64 default world,
+// that one flag accounted for 55 of 115 draw calls.
 
 /**
  * Creates 3D Sprite Oak Tree (Maximum 4 Sprites).
@@ -146,7 +153,7 @@ export function createOakTreeSpriteModel(packId: SpritePackType): TreeModelAsset
 
   const mat = new THREE.MeshStandardMaterial({
     map: texture,
-    transparent: true,
+    transparent: false,
     alphaTest: 0.15,
     depthWrite: true,
     depthTest: true,
@@ -184,7 +191,7 @@ export function createPineTreeSpriteModel(packId: SpritePackType): TreeModelAsse
 
   const mat = new THREE.MeshStandardMaterial({
     map: texture,
-    transparent: true,
+    transparent: false,
     alphaTest: 0.15,
     depthWrite: true,
     depthTest: true,
@@ -225,7 +232,7 @@ export function createBushSpriteModel(packId: SpritePackType): TreeModelAssets {
 
   const mat = new THREE.MeshStandardMaterial({
     map: texture,
-    transparent: true,
+    transparent: false,
     alphaTest: 0.15,
     depthWrite: true,
     depthTest: true,
@@ -265,7 +272,7 @@ export function createMushroomSpriteModel(packId: SpritePackType): TreeModelAsse
 
   const mat = new THREE.MeshStandardMaterial({
     map: texture,
-    transparent: true,
+    transparent: false,
     alphaTest: 0.15,
     depthWrite: true,
     depthTest: true,

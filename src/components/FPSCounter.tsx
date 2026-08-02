@@ -47,7 +47,7 @@ const GLYPHS: ReadonlyArray<ReadonlyArray<number>> = [
 // Reusable integer buffer for glyph indices to prevent garbage collection
 const CHAR_BUFFER = new Int32Array(8);
 
-export const FPSCounter: React.FC<FPSCounterProps> = ({ fps, themeColor = '#22c55e' }) => {
+const FPSCounterComponent: React.FC<FPSCounterProps> = ({ fps, themeColor = '#22c55e' }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   const clampedFps = Math.min(999, Math.max(0, fps | 0));
@@ -151,3 +151,5 @@ export const FPSCounter: React.FC<FPSCounterProps> = ({ fps, themeColor = '#22c5
     </div>
   );
 };
+
+export const FPSCounter = React.memo(FPSCounterComponent);
