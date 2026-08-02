@@ -14,6 +14,9 @@ import { TilePoolManager } from './TilePoolManager';
 import { FrustumCuller } from './FrustumCuller';
 import { findMountainClusters, buildMountainMeshForRegion, MountainCluster } from '../utils/mountainMesh';
 import { SPRITE_DEFS } from '../utils/spriteDefs';
+import { EntityStore, EntityType } from '../game/EntityStore';
+import { UpdateScheduler } from '../game/UpdateScheduler';
+import { EntityRenderer } from '../game/EntityRenderer';
 
 // Ground slab drawn beneath foliage tiles.
 const FOLIAGE_GROUND_HEIGHT = 0.1;
@@ -27,6 +30,10 @@ const MAX_FAKE_LIGHT_EMITTERS = 24;
 // so a single-chunk world (the 64x64 default) still finishes in one call.
 const INITIAL_BUILD_BUDGET_MS = 8;
 const PER_FRAME_BUILD_BUDGET_MS = 4;
+
+// Entities have no behaviour yet; the scheduler is wired up and banding so that
+// gameplay systems slot in without revisiting the frame loop.
+const NOOP_ENTITY_UPDATE = () => {};
 
 // Exponential rate for the day/night sun interpolation, in units of 1/second.
 // -ln(1 - 0.08) * 60 reproduces the old per-frame 0.08 lerp at 60 FPS.
@@ -149,6 +156,13 @@ export class TileRenderer {
   // streams in instead of freezing the main thread for hundreds of milliseconds.
   // Retained so the fake-light tint can be baked lazily, after the build.
   private buildTileEngine: TileDataEngine | null = null;
+
+  // Entities. The store is columns of typed arrays, the scheduler updates them
+  // at a rate that falls off with distance, and the renderer draws each visual
+  // type in a single instanced call.
+  public entities = new EntityStore(1024);
+  public entityScheduler = new UpdateScheduler(1024);
+  private entityRenderer: EntityRenderer | null = null;
 
   private buildJob: {
     tileEngine: TileDataEngine;
@@ -768,19 +782,16 @@ export class TileRenderer {
       if (found) break;
     }
 
-    this.adventurerMaterial = new THREE.SpriteMaterial({
-      map: this.adventurerTexture,
-      transparent: true,
-      alphaTest: 0.08,
-      depthWrite: false,
-      depthTest: true,
-    });
-    const adventurer = new THREE.Sprite(this.adventurerMaterial);
-    adventurer.name = 'CenterDungeonAdventurer';
-    adventurer.position.set(playerX, playerHeight + 0.68, playerZ);
-    adventurer.scale.set(0.95, 1.35, 1);
-    adventurer.renderOrder = 3;
-    this.worldGroup.add(adventurer);
+    // The adventurer is an entity like anything else, drawn by the instanced
+    // billboard renderer rather than as a one-off Sprite object.
+    this.entities.clear();
+    this.entities.spawn(EntityType.Adventurer, playerX, playerHeight + 0.68, playerZ, 0, 1);
+
+    if (!this.entityRenderer) {
+      this.entityRenderer = new EntityRenderer(this.adventurerTexture, EntityType.Adventurer, 1024);
+      this.scene.add(this.entityRenderer.mesh);
+    }
+    this.entityRenderer.sync(this.entities);
 
     this.lightEmitters = tileEngine.emitters;
     this.lastTargetX = NaN;
@@ -829,7 +840,11 @@ export class TileRenderer {
     // shared with the old one and stay alive.
     if (this.lightTintMesh.instanceMatrix.count < totalCells) {
       this.fakeLightGroup.remove(this.lightTintMesh);
-      this.lightTintMesh.dispose();
+      this.entityRenderer?.dispose();
+    this.entityRenderer = null;
+    this.entities.clear();
+
+    this.lightTintMesh.dispose();
       this.lightTintMesh = new THREE.InstancedMesh(this.tintGeometry, this.tintMaterial, totalCells);
       this.lightTintMesh.frustumCulled = false;
       this.fakeLightGroup.add(this.lightTintMesh);
@@ -1251,6 +1266,18 @@ export class TileRenderer {
       this.lastLightType = 'realtime';
     }
 
+    // 5a. Entity simulation, then push transforms into the instanced billboards.
+    if (!isPaused && this.entities.count > 0) {
+      this.entityScheduler.tick(
+        this.entities,
+        delta,
+        this.controls.target.x,
+        this.controls.target.z,
+        NOOP_ENTITY_UPDATE
+      );
+    }
+    this.entityRenderer?.sync(this.entities);
+
     // 5b. Continue any in-flight world build within this frame's budget.
     this.drainBuildQueue(PER_FRAME_BUILD_BUDGET_MS);
 
@@ -1361,6 +1388,10 @@ export class TileRenderer {
       this.floorMesh.geometry.dispose();
       this.floorMesh = null;
     }
+
+    this.entityRenderer?.dispose();
+    this.entityRenderer = null;
+    this.entities.clear();
 
     this.lightTintMesh.dispose();
     this.fakeLightSourcesMesh.dispose();
