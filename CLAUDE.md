@@ -14,6 +14,7 @@ npm run build     # Build for production (generates dist/)
 npm run preview   # Preview the production build locally
 npm run lint      # TypeScript type checking (no emits)
 npm run clean     # Remove dist/ and server.js
+npm run perf      # Build, then assert the rendering budgets in scripts/perf-budgets.json
 ```
 
 **Development server** uses Vite with HMR enabled by default. The server runs on `http://localhost:3000` locally or respects the `PORT` environment variable (for Replit deployments). File watching is disabled when `DISABLE_HMR=true` to prevent flickering during agent edits.
@@ -106,7 +107,7 @@ Three core rendering modules in `src/rendering/`:
 3. **Shared Resource Cache** - TilePoolManager caches geometry, materials and textures across world rebuilds.
 
 4. **Instanced Rendering** - Batches identical tiles into single draw call via THREE.InstancedMesh. The
-   default 64x64 world renders in ~10 draw calls; treat a rise in `renderer.info.render.calls` as a regression.
+   default 64x64 world renders in ~10 draw calls. `npm run perf` enforces this; see scripts/perf-budgets.json.
 
 5. **3D vs. 2D Trees** - `use3DSpriteTrees` setting allows toggling expensive 3D tree geometry for performance tuning.
 
@@ -124,8 +125,17 @@ Three core rendering modules in `src/rendering/`:
 9. **World size is dynamic** - Nothing in `TileRenderer` may assume 64x64. Buffers size from
    `tileEngine.rows/cols`, and `mesh.count` must never exceed `instanceMatrix.count`.
 
-10. **Rebuild only for geometry changes** - `buildWorld()` is a synchronous full rebuild (~12 ms at 64x64).
-    Theme changes go through `applyTheme()`; only `worldGrid` and `spritePack` should trigger a rebuild.
+10. **Rebuild only for geometry changes** - Theme changes go through `applyTheme()`; only the WorldSpec and
+    `spritePack` trigger a rebuild. Building is chunk-incremental and time-budgeted (8 ms in `buildWorld`, then
+    4 ms per frame), so a large world streams in rather than freezing.
+
+11. **World generation runs on a worker** - `utils/worldGenClient.ts` posts to `worldGen.worker.ts` and gets
+    transferred typed arrays back. Keep `spriteDefs.ts`, `worldGen.ts` and `worldPayload.ts` free of Three.js
+    and DOM references, or the worker bundle gains a second copy of Three.js.
+
+12. **Entities are typed-array columns** - `game/EntityStore.ts` is structure-of-arrays with generation-tagged
+    handles; `game/UpdateScheduler.ts` updates them at a rate that falls off with distance; `game/EntityRenderer.ts`
+    draws each visual type in one instanced billboard call. 10,000 entities cost 1 draw call.
 
 ## Development Notes
 

@@ -1,0 +1,15 @@
+{
+  "_comment": "Rendering budgets for the default 64x64 world, checked by scripts/perf-check.mjs against a production build. These are counts, not timings: counts are deterministic and reproduce identically in CI, whereas frame timings depend on the runner's hardware and would be flaky enough to get ignored. Budgets sit just above measured values on purpose - loose budgets let real regressions through. Raise one only alongside a deliberate change that justifies it.",
+  "drawCalls": {
+    "max": 12,
+    "note": "Measured 10. Most likely causes of a jump: alpha blending back on foliage (transparent:true with side:DoubleSide makes Three.js draw every mesh twice), or geometry split per chunk-and-type again instead of per type."
+  },
+  "triangles": {
+    "max": 40000,
+    "note": "Measured 33,838. Most likely causes: flat ground tiles regressing from the 2-triangle top quad to the 12-triangle box, or foliage being drawn twice by the double-sided transparent path."
+  },
+  "entryChunkBytes": {
+    "max": 340000,
+    "note": "Measured ~301 KB. Guards against the pause screen, sprite atlas modal or standalone exporter being pulled back into the entry chunk."
+  }
+}

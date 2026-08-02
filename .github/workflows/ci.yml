@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Type check
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      # Guards the rendering budgets in scripts/perf-budgets.json. Counts, not
+      # timings, so this is stable on shared CI runners. WebGL runs on
+      # SwiftShader; no GPU required.
+      - name: Install Chromium for the performance gate
+        run: npx playwright install --with-deps chromium
+
+      - name: Rendering performance budgets
+        run: node scripts/perf-check.mjs
