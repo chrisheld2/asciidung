@@ -3,6 +3,7 @@ import { PauseTab, ColorTheme, MazeStats, CameraPreset, SpritePackType, LightTyp
 import { renderMetricsStore } from '../utils/renderMetricsStore';
 import { COLOR_THEMES, SPRITE_PACKS, playTerminalBeep } from '../utils/sprites';
 import { formatInGameTime } from './HUDControls';
+import { GAME_VERSION } from '../version';
 import { Play, Pause, Maximize2, Minimize2, ChartBar as BarChart2, Palette, Camera, Volume2, VolumeX, Sparkles, RefreshCw, RotateCw, Box, Focus, Download, Grid2x2 as Grid, Clock, Activity, Cpu, X, FileSliders as Sliders, Layers, Trash2, Monitor, Check, ShieldAlert, Flame, TreePine, Mountain, Waves, Castle, KeyRound, Compass, Sun, Moon, Lock, Clock as Unlock, FastForward, Zap, Lightbulb, Search } from 'lucide-react';
 
 export interface SearchableUIElement {
@@ -541,7 +542,7 @@ const PauseScreenComponent: React.FC<PauseScreenProps> = ({
                 <Pause size={18} />
                 SYSTEM PAUSED // CONTROL PANEL
               </h2>
-              <p className="text-[10px] sm:text-xs text-zinc-400">Press ESC or click Resume to return to game</p>
+              <p className="text-[10px] sm:text-xs text-zinc-400">v{GAME_VERSION} • Press ESC or click Resume to return to game</p>
             </div>
           </div>
 
@@ -1787,7 +1788,7 @@ const PauseScreenComponent: React.FC<PauseScreenProps> = ({
 
         {/* Footer Bar */}
         <div className="px-6 py-3 border-t border-zinc-800/80 bg-zinc-950 flex items-center justify-between text-[11px] text-zinc-500">
-          <span>SPRITEDUNG v4.0 // 8x8 Low-Poly Engine</span>
+          <span>SPRITEDUNG v{GAME_VERSION} // 8x8 Low-Poly Engine</span>
           <div className="flex items-center gap-2">
             <span>Press <kbd className="px-1 py-0.5 bg-zinc-800 rounded text-zinc-300 font-bold">ESC</kbd> to exit menu</span>
           </div>
