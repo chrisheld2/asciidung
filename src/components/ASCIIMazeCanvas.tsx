@@ -1,12 +1,13 @@
 import React, { useEffect, useRef } from 'react';
 import * as THREE from 'three';
-import { ColorTheme, WorldCell, MazeStats, CameraPreset, SpritePackType, DayNightState, LightType } from '../types';
+import { ColorTheme, MazeStats, CameraPreset, SpritePackType, DayNightState, LightType, WorldSpec } from '../types';
 import { renderMetricsStore } from '../utils/renderMetricsStore';
 import { TileDataEngine } from '../rendering/TileData';
+import { generateWorld } from '../utils/worldGenClient';
 import { TileRenderer } from '../rendering/TileRenderer';
 
 interface ASCIIMazeCanvasProps {
-  worldGrid: WorldCell[][];
+  world: WorldSpec;
   theme: ColorTheme;
   spritePack: SpritePackType;
   translucencyRatio: number;
@@ -196,7 +197,7 @@ const applyPresetPosition = (
 };
 
 export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
-  worldGrid,
+  world,
   theme,
   spritePack,
   translucencyRatio,
@@ -240,6 +241,11 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
   useEffect(() => {
     dayNightStateRef.current = dayNightState;
   }, [dayNightState]);
+
+  const cameraPresetRef = useRef(cameraPreset);
+  useEffect(() => {
+    cameraPresetRef.current = cameraPreset;
+  }, [cameraPreset]);
 
   const themeRef = useRef(theme);
   useEffect(() => {
@@ -349,11 +355,16 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
     };
     tileRenderer.controls.addEventListener('change', handleControlsChange);
 
+    // Every save path is gated on the camera having been initialised. World
+    // generation is asynchronous, so until it completes the camera is still at
+    // the origin - checkpointing that would persist a broken viewpoint and
+    // restore it on the next load.
     const handleUnload = () => {
+      if (!hasInitializedCameraRef.current) return;
       saveCameraStateImmediate(tileRenderer, isOrthographicRef.current);
     };
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'hidden') {
+      if (document.visibilityState === 'hidden' && hasInitializedCameraRef.current) {
         saveCameraStateImmediate(tileRenderer, isOrthographicRef.current);
       }
     };
@@ -369,6 +380,16 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
     window.addEventListener('beforeunload', handleUnload);
     window.addEventListener('pagehide', handleUnload);
     document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    // Frame the world immediately. Without this the camera sits at the origin,
+    // co-located with its orbit target, until generation completes - and
+    // OrbitControls resolves that degenerate state by shoving it to minDistance.
+    applyPresetPosition(
+      tileRenderer,
+      cameraPresetRef.current,
+      tileEngineRef.current.rows,
+      tileEngineRef.current.cols
+    );
 
     const handleResize = () => {
       if (!containerRef.current) return;
@@ -433,7 +454,9 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
     animate();
 
     return () => {
-      saveCameraStateImmediate(tileRenderer, isOrthographicRef.current);
+      if (hasInitializedCameraRef.current) {
+        saveCameraStateImmediate(tileRenderer, isOrthographicRef.current);
+      }
       window.clearInterval(cameraSaveInterval);
       if (saveTimer !== null) {
         window.clearTimeout(saveTimer);
@@ -458,52 +481,63 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
 
   const prevStatsJsonRef = useRef<string>('');
 
-  // Rebuild 64x64 World whenever worldGrid, theme, spritePack, or translucencyRatio changes
+  // Generate and rebuild the world whenever its recipe or the sprite pack changes.
   useEffect(() => {
     const tileRenderer = rendererInstanceRef.current;
     if (!tileRenderer) return;
 
-    const tileEngine = tileEngineRef.current;
-    tileEngine.loadWorldGrid(worldGrid);
+    let cancelled = false;
 
-    tileRenderer.buildWorld(tileEngine, worldGrid, spritePack, themeRef.current);
+    // Generation runs on a worker and comes back as transferred typed arrays.
+    // The WorldCell grid never reaches this thread, let alone React state.
+    generateWorld(world.seed, world.rows, world.cols).then((payload) => {
+      if (cancelled || !rendererInstanceRef.current) return;
 
-    const activeCam = isOrthographic ? tileRenderer.orthoCamera : tileRenderer.perspCamera;
-    tileRenderer.activeCamera = activeCam;
-    tileRenderer.controls.object = activeCam;
+      const tileEngine = tileEngineRef.current;
+      tileEngine.adopt(payload);
+      tileRenderer.buildWorld(tileEngine, spritePack, themeRef.current);
 
-    if (!hasInitializedCameraRef.current && tileRenderer.controls) {
-      const saved = loadSavedCameraState();
+      const activeCam = isOrthographic ? tileRenderer.orthoCamera : tileRenderer.perspCamera;
+      tileRenderer.activeCamera = activeCam;
+      tileRenderer.controls.object = activeCam;
 
-      if (saved) {
-        tileRenderer.perspCamera.position.set(saved.perspPos.x, saved.perspPos.y, saved.perspPos.z);
-        tileRenderer.orthoCamera.position.set(saved.orthoPos.x, saved.orthoPos.y, saved.orthoPos.z);
-        tileRenderer.orthoCamera.zoom = saved.orthoZoom;
-        tileRenderer.orthoCamera.updateProjectionMatrix();
-        tileRenderer.perspCamera.updateProjectionMatrix();
+      if (!hasInitializedCameraRef.current && tileRenderer.controls) {
+        const saved = loadSavedCameraState();
 
-        tileRenderer.controls.target.set(saved.target.x, saved.target.y, saved.target.z);
-        tileRenderer.controls.update();
+        if (saved) {
+          tileRenderer.perspCamera.position.set(saved.perspPos.x, saved.perspPos.y, saved.perspPos.z);
+          tileRenderer.orthoCamera.position.set(saved.orthoPos.x, saved.orthoPos.y, saved.orthoPos.z);
+          tileRenderer.orthoCamera.zoom = saved.orthoZoom;
+          tileRenderer.orthoCamera.updateProjectionMatrix();
+          tileRenderer.perspCamera.updateProjectionMatrix();
 
-        activeCam.updateMatrixWorld(true);
-        if (tileRenderer.frustumCuller) {
-          tileRenderer.frustumCuller.updateVisibility(activeCam);
+          tileRenderer.controls.target.set(saved.target.x, saved.target.y, saved.target.z);
+          tileRenderer.controls.update();
+
+          activeCam.updateMatrixWorld(true);
+          if (tileRenderer.frustumCuller) {
+            tileRenderer.frustumCuller.updateVisibility(activeCam);
+          }
+        } else {
+          applyPresetPosition(tileRenderer, cameraPreset, tileEngine.rows, tileEngine.cols);
         }
-      } else {
-        applyPresetPosition(tileRenderer, cameraPreset, tileEngine.rows, tileEngine.cols);
+        hasInitializedCameraRef.current = true;
       }
-      hasInitializedCameraRef.current = true;
-    }
 
-    const statsJson = JSON.stringify(tileEngine.stats);
-    if (statsJson !== prevStatsJsonRef.current) {
-      prevStatsJsonRef.current = statsJson;
-      onStatsChange(tileEngine.stats);
-    }
-    // Only the grid and the sprite pack change geometry or materials. Theme is a
-    // light-colour swap (handled below) and translucencyRatio does not reach the
-    // renderer at all - rebuilding the world for either was pure cost.
-  }, [worldGrid, spritePack]);
+      const statsJson = JSON.stringify(tileEngine.stats);
+      if (statsJson !== prevStatsJsonRef.current) {
+        prevStatsJsonRef.current = statsJson;
+        onStatsChange(tileEngine.stats);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+    // Only the world recipe and the sprite pack change geometry or materials.
+    // Theme is a light-colour swap (handled below) and translucencyRatio does not
+    // reach the renderer at all - rebuilding the world for either was pure cost.
+  }, [world.seed, world.rows, world.cols, world.version, spritePack]);
 
   // Theme changes are just light colours, so they never rebuild the world.
   useEffect(() => {

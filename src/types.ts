@@ -65,6 +65,18 @@ export interface WorldCell {
   isRuin?: boolean;
 }
 
+/**
+ * How to generate a world. The generated grid is never stored: it is produced,
+ * consumed into TileDataEngine's typed arrays, and discarded.
+ */
+export interface WorldSpec {
+  seed: number;
+  rows: number;
+  cols: number;
+  /** Bump to force a rebuild when seed and dimensions are unchanged. */
+  version: number;
+}
+
 export interface MazeStats {
   rows: number;
   cols: number;

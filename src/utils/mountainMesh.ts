@@ -1,16 +1,12 @@
 import * as THREE from 'three';
-import { WorldCell, SpritePackType } from '../types';
-import { SPRITE_PACKS, multiOctaveNoise2D } from './sprites';
+import { SpritePackType } from '../types';
+import { SPRITE_PACKS } from './spriteDefs';
+import { multiOctaveNoise2D } from './worldGen';
+import { TileDataEngine, BLOCK_ID_MOUNTAIN_HIGH, isMountainBlock } from '../rendering/TileData';
 
-// Check if a cell represents a mountain or rock terrain block
-export function isMountainCell(cell: WorldCell | undefined): boolean {
-  if (!cell) return false;
-  return cell.type === 'mountain_low' || cell.type === 'mountain_high' || cell.type === 'rock';
-}
-
-interface MountainCluster {
+export interface MountainCluster {
   cells: Set<number>; // r * cols + c
-  cellList: Array<{ r: number; c: number; cell: WorldCell }>;
+  cellList: Array<{ r: number; c: number; blockId: number; height: number }>;
 }
 
 /**
@@ -21,9 +17,9 @@ interface MountainCluster {
  * strings per cell visit and paid O(n) per dequeue, which made this quadratic in
  * the number of mountain tiles.
  */
-export function findMountainClusters(grid: WorldCell[][]): MountainCluster[] {
-  const rows = grid.length;
-  const cols = grid[0].length;
+export function findMountainClusters(tileEngine: TileDataEngine): MountainCluster[] {
+  const rows = tileEngine.rows;
+  const cols = tileEngine.cols;
   const total = rows * cols;
   const visited = new Uint8Array(total);
   const queue = new Int32Array(total);
@@ -32,12 +28,12 @@ export function findMountainClusters(grid: WorldCell[][]): MountainCluster[] {
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
       const start = r * cols + c;
-      if (visited[start] || !isMountainCell(grid[r][c])) {
+      if (visited[start] || !isMountainBlock(tileEngine.blockTypeIds[start])) {
         continue;
       }
 
       const clusterCells = new Set<number>();
-      const cellList: Array<{ r: number; c: number; cell: WorldCell }> = [];
+      const cellList: MountainCluster['cellList'] = [];
       let head = 0;
       let tail = 0;
       queue[tail++] = start;
@@ -48,7 +44,12 @@ export function findMountainClusters(grid: WorldCell[][]): MountainCluster[] {
         const currR = (current / cols) | 0;
         const currC = current - currR * cols;
         clusterCells.add(current);
-        cellList.push({ r: currR, c: currC, cell: grid[currR][currC] });
+        cellList.push({
+          r: currR,
+          c: currC,
+          blockId: tileEngine.blockTypeIds[current],
+          height: tileEngine.heights[current],
+        });
 
         for (let n = 0; n < 4; n++) {
           const nr = currR + (n === 0 ? -1 : n === 1 ? 1 : 0);
@@ -56,7 +57,7 @@ export function findMountainClusters(grid: WorldCell[][]): MountainCluster[] {
           if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) continue;
 
           const nKey = nr * cols + nc;
-          if (!visited[nKey] && isMountainCell(grid[nr][nc])) {
+          if (!visited[nKey] && isMountainBlock(tileEngine.blockTypeIds[nKey])) {
             visited[nKey] = 1;
             queue[tail++] = nKey;
           }
@@ -84,26 +85,18 @@ function hexToRGB(hex: string): [number, number, number] {
 function getMountainHeightAt(
   x: number,
   z: number,
-  grid: WorldCell[][],
+  tileEngine: TileDataEngine,
   centerX: number,
   centerZ: number,
   seed = 42
 ): number {
-  const rows = grid.length;
-  const cols = grid[0].length;
-
   // Convert centered world position back to grid indices
   const gridC = Math.floor(x + centerX);
   const gridR = Math.floor(z + centerZ);
 
   let baseH = 0.2;
-  if (gridR >= 0 && gridR < rows && gridC >= 0 && gridC < cols) {
-    const cell = grid[gridR][gridC];
-    if (isMountainCell(cell)) {
-      if (cell.type === 'mountain_high') baseH = cell.height; // ~4.0
-      else if (cell.type === 'mountain_low') baseH = cell.height; // ~2.5
-      else baseH = cell.height; // rock ~1.2
-    }
+  if (isMountainBlock(tileEngine.blockAt(gridR, gridC))) {
+    baseH = tileEngine.heightAt(gridR, gridC);
   }
 
   // Multi-octave mountain peak & ridge noise displacement
@@ -188,25 +181,32 @@ function getLowPolyMountainColor(
 }
 
 /**
- * Creates a single, unified low-poly mesh for all mountain clusters on the grid.
- * Merges adjacent grid tiles into continuous mountain ridges, removes internal faces,
- * and applies sharp faceted low-poly styling and height/slope color gradients.
+ * Build the low-poly mountain mesh for one rectangular region of the grid.
+ *
+ * Clusters are found once for the whole world and passed in, because skirt
+ * generation needs to know whether a neighbour belongs to the same cluster even
+ * when that neighbour sits in another chunk. Only tiles inside [minR, maxR) x
+ * [minC, maxC) contribute geometry, so each chunk can build and cull its own
+ * mountains, and a large world can build them a chunk at a time.
+ *
+ * Returns null when the region contains no mountain tiles.
  */
-export function buildUnifiedMountainMeshGroup(
-  grid: WorldCell[][],
-  packId: SpritePackType = 'retro',
+export function buildMountainMeshForRegion(
+  tileEngine: TileDataEngine,
+  clusters: MountainCluster[],
+  packId: SpritePackType,
+  minR: number,
+  maxR: number,
+  minC: number,
+  maxC: number,
   seed = 42
-): THREE.Group {
-  const mountainGroup = new THREE.Group();
-  mountainGroup.name = 'UnifiedMountainMeshGroup';
-
-  const rows = grid.length;
-  const cols = grid[0].length;
+): THREE.Mesh | null {
+  const rows = tileEngine.rows;
+  const cols = tileEngine.cols;
   const centerX = cols / 2 - 0.5;
   const centerZ = rows / 2 - 0.5;
 
-  const clusters = findMountainClusters(grid);
-  if (clusters.length === 0) return mountainGroup;
+  if (clusters.length === 0) return null;
 
   const positions: number[] = [];
   const colors: number[] = [];
@@ -260,14 +260,15 @@ export function buildUnifiedMountainMeshGroup(
 
     const vx = x + jitterX;
     const vz = z + jitterZ;
-    const vy = getMountainHeightAt(vx, vz, grid, centerX, centerZ, seed);
+    const vy = getMountainHeightAt(vx, vz, tileEngine, centerX, centerZ, seed);
     return [vx, vy, vz];
   }
 
   // Iterate over each mountain cluster
   clusters.forEach((cluster) => {
     // Process each tile in the cluster
-    cluster.cellList.forEach(({ r, c, cell }) => {
+    cluster.cellList.forEach(({ r, c, blockId }) => {
+      if (r < minR || r >= maxR || c < minC || c >= maxC) return;
       const worldX = c - centerX;
       const worldZ = r - centerZ;
 
@@ -285,7 +286,7 @@ export function buildUnifiedMountainMeshGroup(
 
       // Center apex vertex for sharp low-poly peak fan
       const avgY = (v00[1] + v10[1] + v11[1] + v01[1]) / 4;
-      const apexBoost = cell.type === 'mountain_high' ? 0.6 : 0.35;
+      const apexBoost = blockId === BLOCK_ID_MOUNTAIN_HIGH ? 0.6 : 0.35;
       const vCenter: [number, number, number] = [worldX, avgY + apexBoost, worldZ];
 
       // Top surface 4 triangles meeting at central apex (CCW winding facing sky/UP)
@@ -296,7 +297,7 @@ export function buildUnifiedMountainMeshGroup(
         [v01, vCenter, v00],
       ];
 
-      const maxH = cell.type === 'mountain_high' ? 5.2 : 3.5;
+      const maxH = blockId === BLOCK_ID_MOUNTAIN_HIGH ? 5.2 : 3.5;
       topTriangles.forEach(([p1, p2, p3]) => pushTriangle(p1, p2, p3, maxH));
 
       // Outer boundary side skirts (ONLY generated if adjacent cell is NOT a mountain tile)
@@ -328,6 +329,8 @@ export function buildUnifiedMountainMeshGroup(
     });
   });
 
+  if (positions.length === 0) return null;
+
   // Create unified BufferGeometry
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
@@ -347,9 +350,9 @@ export function buildUnifiedMountainMeshGroup(
   });
 
   const mountainMesh = new THREE.Mesh(geometry, material);
+  mountainMesh.name = 'ChunkMountainMesh';
   mountainMesh.castShadow = true;
   mountainMesh.receiveShadow = true;
-  mountainGroup.add(mountainMesh);
 
-  return mountainGroup;
+  return mountainMesh;
 }

@@ -1,28 +1,32 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { ColorTheme, CameraPreset, SpritePackType, RenderMetrics, DayNightState, LightEmitter, LightType } from '../types';
-import { TileDataEngine, BLOCK_TYPE_TO_INDEX } from './TileData';
+import {
+  TileDataEngine,
+  BLOCK_ID_EMPTY,
+  BLOCK_ID_TREE_OAK,
+  BLOCK_ID_TREE_PINE,
+  BLOCK_ID_BUSH,
+  isFoliageBlock,
+  isMountainBlock,
+} from './TileData';
 import { TilePoolManager } from './TilePoolManager';
 import { FrustumCuller } from './FrustumCuller';
-import { buildUnifiedMountainMeshGroup } from '../utils/mountainMesh';
-import { SPRITE_DEFS } from '../utils/sprites';
-
-// Integer block ids, resolved once. The build loop runs per tile, so comparing
-// numbers beats the string prefix tests it used to do.
-const BLOCK_ID_EMPTY = 255;
-const BLOCK_ID_TREE_OAK = BLOCK_TYPE_TO_INDEX.tree_oak;
-const BLOCK_ID_TREE_PINE = BLOCK_TYPE_TO_INDEX.tree_pine;
-const BLOCK_ID_BUSH = BLOCK_TYPE_TO_INDEX.bush;
-const BLOCK_ID_MUSHROOM = BLOCK_TYPE_TO_INDEX.mushroom;
-const BLOCK_ID_MOUNTAIN_LOW = BLOCK_TYPE_TO_INDEX.mountain_low;
-const BLOCK_ID_MOUNTAIN_HIGH = BLOCK_TYPE_TO_INDEX.mountain_high;
-const BLOCK_ID_ROCK = BLOCK_TYPE_TO_INDEX.rock;
+import { findMountainClusters, buildMountainMeshForRegion, MountainCluster } from '../utils/mountainMesh';
+import { SPRITE_DEFS } from '../utils/spriteDefs';
 
 // Ground slab drawn beneath foliage tiles.
 const FOLIAGE_GROUND_HEIGHT = 0.1;
 
 // Emitters considered by the fake-lighting mode, nearest first.
 const MAX_FAKE_LIGHT_EMITTERS = 24;
+
+// Time budgets for world building, in milliseconds. buildWorld spends at most
+// the first budget before handing the remainder to the frame loop, which then
+// spends at most the second per frame. Both always complete at least one chunk,
+// so a single-chunk world (the 64x64 default) still finishes in one call.
+const INITIAL_BUILD_BUDGET_MS = 8;
+const PER_FRAME_BUILD_BUDGET_MS = 4;
 
 // Exponential rate for the day/night sun interpolation, in units of 1/second.
 // -ln(1 - 0.08) * 60 reproduces the old per-frame 0.08 lerp at 60 FPS.
@@ -123,6 +127,7 @@ export class TileRenderer {
   private tintMaterial: THREE.Material;
   private tileHeights: Float32Array = new Float32Array(0);
   private tintAttenuation: Float32Array = new Float32Array(0);
+  private tintDirty = true;
   private lastLightType: LightType = 'realtime';
 
   // World dimensions, mirrored from the tile engine on every build. Nothing in
@@ -137,7 +142,20 @@ export class TileRenderer {
   // Geometry this renderer owns for the current world and must dispose on
   // rebuild. Shared cache resources are deliberately excluded.
   private ownedGeometries: THREE.BufferGeometry[] = [];
+  private ownedMaterials: THREE.Material[] = [];
   private adventurerMaterial: THREE.SpriteMaterial | null = null;
+
+  // In-flight world build. Chunks are built a few per frame so a large world
+  // streams in instead of freezing the main thread for hundreds of milliseconds.
+  // Retained so the fake-light tint can be baked lazily, after the build.
+  private buildTileEngine: TileDataEngine | null = null;
+
+  private buildJob: {
+    tileEngine: TileDataEngine;
+    spritePack: SpritePackType;
+    clusters: MountainCluster[];
+    pending: number[];
+  } | null = null;
 
   // Latest pointer position, resolved to a world hit once per frame rather than
   // once per pointer event.
@@ -384,20 +402,257 @@ export class TileRenderer {
   }
 
   /**
+   * Build one pending chunk: its terrain batches, its foliage and its mountains.
+   *
+   * Everything a chunk owns lives under `chunk.group`, so it culls as a unit and
+   * a future streaming layer can add and drop chunks without touching the rest
+   * of the scene.
+   */
+  private buildNextChunk(): boolean {
+    const job = this.buildJob;
+    if (!job || job.pending.length === 0) return false;
+
+    const chunkIndex = job.pending.shift() as number;
+    const chunk = this.frustumCuller.chunks[chunkIndex];
+    if (!chunk) return job.pending.length > 0;
+
+    const { tileEngine, spritePack, clusters } = job;
+    const cols = tileEngine.cols;
+    const rows = tileEngine.rows;
+    const centerX = this.centerX;
+    const centerZ = this.centerZ;
+    const chunkSize = this.frustumCuller.chunkSize;
+
+    const minC = chunk.chunkX * chunkSize;
+    const maxC = Math.min(cols, minC + chunkSize);
+    const minR = chunk.chunkZ * chunkSize;
+    const maxR = Math.min(rows, minR + chunkSize);
+
+    // Height of the surface a neighbouring tile presents, used to decide whether
+    // this tile's sides can be seen. Reads across the chunk edge on purpose, so
+    // chunk seams do not sprout walls.
+    const surfaceHeightAt = (r: number, c: number): number => {
+      const id = tileEngine.blockAt(r, c);
+      if (id === BLOCK_ID_EMPTY) return -Infinity; // map edge or hole: sides exposed
+      if (isMountainBlock(id)) return Infinity; // mountain mesh skirts to the floor
+      if (isFoliageBlock(id)) return FOLIAGE_GROUND_HEIGHT;
+      return tileEngine.heightAt(r, c);
+    };
+
+    // Ground tiles whose four neighbours are at least as tall have completely
+    // hidden sides and only need their top face: 2 triangles instead of 12.
+    const flatInstances: TerrainInstanceData[] = [];
+    const solidInstances: TerrainInstanceData[] = [];
+    const foliage = {
+      oak: [] as TreeInstanceData[],
+      pine: [] as TreeInstanceData[],
+      bush: [] as TreeInstanceData[],
+      mushroom: [] as TreeInstanceData[],
+    };
+
+    const pushTerrainInstance = (r: number, c: number, height: number, spriteIndex: number) => {
+      const instance: TerrainInstanceData = {
+        x: c - centerX,
+        y: height / 2 - 0.5,
+        z: r - centerZ,
+        height,
+        spriteIndex,
+      };
+
+      const exposed =
+        surfaceHeightAt(r - 1, c) < height - 1e-4 ||
+        surfaceHeightAt(r + 1, c) < height - 1e-4 ||
+        surfaceHeightAt(r, c - 1) < height - 1e-4 ||
+        surfaceHeightAt(r, c + 1) < height - 1e-4;
+
+      if (exposed) solidInstances.push(instance);
+      else flatInstances.push(instance);
+    };
+
+    for (let r = minR; r < maxR; r++) {
+      for (let c = minC; c < maxC; c++) {
+        const idx = r * cols + c;
+        const blockId = tileEngine.blockTypeIds[idx];
+        if (blockId === BLOCK_ID_EMPTY) continue;
+
+        if (isFoliageBlock(blockId)) {
+          pushTerrainInstance(r, c, FOLIAGE_GROUND_HEIGHT, tileEngine.spriteIndices[idx]);
+
+          const seedVal = r * 31 + c * 17;
+          const pseudoRng = Math.abs(Math.sin(seedVal));
+          const scaleVar = 0.85 + (pseudoRng % 0.3);
+          const instance: TreeInstanceData = {
+            x: c - centerX,
+            y: -0.45,
+            z: r - centerZ,
+            rotY: pseudoRng * Math.PI * 2,
+            scaleX: scaleVar,
+            scaleY: blockId === BLOCK_ID_TREE_PINE ? scaleVar * 1.15 : scaleVar,
+            scaleZ: scaleVar,
+          };
+
+          if (blockId === BLOCK_ID_TREE_OAK) foliage.oak.push(instance);
+          else if (blockId === BLOCK_ID_TREE_PINE) foliage.pine.push(instance);
+          else if (blockId === BLOCK_ID_BUSH) foliage.bush.push(instance);
+          else foliage.mushroom.push(instance);
+          continue;
+        }
+
+        if (isMountainBlock(blockId)) continue; // handled by the mountain mesh below
+
+        pushTerrainInstance(r, c, tileEngine.heights[idx], tileEngine.spriteIndices[idx]);
+      }
+    }
+
+    const sideMaterial = this.poolManager.getOpaqueSideMaterial();
+    const topMaterial = this.poolManager.getTopAtlasMaterial(spritePack);
+
+    const buildTerrainBatch = (
+      instances: TerrainInstanceData[],
+      geometry: THREE.BufferGeometry,
+      materials: THREE.Material | THREE.Material[],
+      name: string
+    ) => {
+      if (instances.length === 0) {
+        geometry.dispose();
+        return;
+      }
+
+      // Owned by this world, never the shared cache: attaching a per-world
+      // instance attribute to a cached geometry orphans the previous
+      // attribute's GPU buffer on every rebuild.
+      this.ownedGeometries.push(geometry);
+
+      const mesh = this.poolManager.createInstancedMesh(geometry, materials, instances.length);
+      const spriteIndices = new Float32Array(instances.length);
+      _tempQuat_1.identity();
+
+      for (let i = 0; i < instances.length; i++) {
+        const instance = instances[i];
+        _tempVec3_1.set(instance.x, instance.y, instance.z);
+        _tempVec3_2.set(1, instance.height, 1);
+        _tempMat4_1.compose(_tempVec3_1, _tempQuat_1, _tempVec3_2);
+        mesh.setMatrixAt(i, _tempMat4_1);
+        spriteIndices[i] = instance.spriteIndex;
+      }
+
+      geometry.setAttribute(
+        'instanceSpriteIndex',
+        new THREE.InstancedBufferAttribute(spriteIndices, 1).setUsage(THREE.StaticDrawUsage)
+      );
+      mesh.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+      mesh.instanceMatrix.needsUpdate = true;
+      mesh.receiveShadow = true;
+      // Bounds must span the instances, not just the unit geometry.
+      mesh.computeBoundingSphere();
+      mesh.computeBoundingBox();
+      mesh.name = name;
+      chunk.group.add(mesh);
+    };
+
+    buildTerrainBatch(
+      flatInstances,
+      this.poolManager.createTerrainTopQuadGeometry(),
+      topMaterial,
+      'BatchedTerrainFlat'
+    );
+    buildTerrainBatch(
+      solidInstances,
+      this.poolManager.createTerrainBoxGeometry(),
+      [sideMaterial, topMaterial],
+      'BatchedTerrainSolid'
+    );
+
+    const buildFoliage = (type: 'oak' | 'pine' | 'bush' | 'mushroom', instances: TreeInstanceData[]) => {
+      if (instances.length === 0) return;
+
+      const model = this.poolManager.getTreeModel(type, spritePack);
+      const mesh = this.poolManager.createInstancedMesh(model.geometry, model.materials, instances.length);
+      mesh.castShadow = true;
+      mesh.receiveShadow = false;
+
+      for (let i = 0; i < instances.length; i++) {
+        const inst = instances[i];
+        _tempVec3_1.set(inst.x, inst.y, inst.z);
+        _tempEuler_1.set(0, inst.rotY, 0);
+        _tempVec3_2.set(inst.scaleX, inst.scaleY, inst.scaleZ);
+        _tempQuat_1.setFromEuler(_tempEuler_1);
+        _tempMat4_1.compose(_tempVec3_1, _tempQuat_1, _tempVec3_2);
+        mesh.setMatrixAt(i, _tempMat4_1);
+      }
+
+      mesh.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+      mesh.instanceMatrix.needsUpdate = true;
+      mesh.computeBoundingSphere();
+      mesh.computeBoundingBox();
+      chunk.group.add(mesh);
+    };
+
+    buildFoliage('oak', foliage.oak);
+    buildFoliage('pine', foliage.pine);
+    buildFoliage('bush', foliage.bush);
+    buildFoliage('mushroom', foliage.mushroom);
+
+    const mountainMesh = buildMountainMeshForRegion(
+      tileEngine,
+      clusters,
+      spritePack,
+      minR,
+      maxR,
+      minC,
+      maxC
+    );
+    if (mountainMesh) {
+      this.ownedGeometries.push(mountainMesh.geometry);
+      this.ownedMaterials.push(mountainMesh.material as THREE.Material);
+      chunk.group.add(mountainMesh);
+    }
+
+    if (job.pending.length === 0) {
+      // The sun's shadow atlas is static; refresh it once the world is complete.
+      this.dirLight.shadow.needsUpdate = true;
+    }
+
+    return job.pending.length > 0;
+  }
+
+  /**
+   * Build pending chunks until the time budget runs out. Always completes at
+   * least one chunk, so progress cannot stall regardless of budget.
+   */
+  private drainBuildQueue(budgetMs: number): void {
+    if (!this.buildJob || this.buildJob.pending.length === 0) return;
+
+    const deadline = performance.now() + budgetMs;
+    do {
+      if (!this.buildNextChunk()) return;
+    } while (performance.now() < deadline);
+  }
+
+  /** True while a world build is still streaming chunks in. */
+  public get isBuilding(): boolean {
+    return this.buildJob !== null && this.buildJob.pending.length > 0;
+  }
+
+  /**
    * Rebuild the whole scene as InstancedMesh batches, for a world of any size.
    */
   public buildWorld(
     tileEngine: TileDataEngine,
-    worldGrid: any[][],
     spritePack: SpritePackType,
     theme: ColorTheme
   ): void {
     // Geometry created for the previous world. Shared cache resources are not
     // in here and must not be disposed.
+    this.buildJob = null;
     for (let i = 0; i < this.ownedGeometries.length; i++) {
       this.ownedGeometries[i].dispose();
     }
     this.ownedGeometries.length = 0;
+    for (let i = 0; i < this.ownedMaterials.length; i++) {
+      this.ownedMaterials[i].dispose();
+    }
+    this.ownedMaterials.length = 0;
 
     if (this.adventurerMaterial) {
       this.adventurerMaterial.dispose();
@@ -455,228 +710,37 @@ export class TileRenderer {
     this.floorMesh.position.set(0, -0.5, 0);
     this.scene.add(this.floorMesh);
 
-    // 2. Setup tree chunks and one GPU-driven terrain batch.
-    // Terrain is cheap to keep resident as a single mesh; trees remain chunked so
-    // their alpha-tested pixels and shadow casters can be culled aggressively.
-    const chunks = this.frustumCuller.createChunks(cols, rows, centerX, centerZ, 40);
+    // 2. Spatial chunks. Terrain, foliage and mountains are all built per chunk,
+    // so a chunk is the unit of frustum culling, of incremental building, and of
+    // any future streaming.
+    const chunks = this.frustumCuller.createChunks(cols, rows, centerX, centerZ, 6);
     chunks.forEach((chunk) => {
       this.worldGroup.add(chunk.group);
     });
 
-    // Ground tiles whose four neighbours are at least as tall have completely
-    // hidden sides and only need their top face. Splitting them off drops those
-    // tiles from 12 triangles to 2.
-    const flatInstances: TerrainInstanceData[] = [];
-    const solidInstances: TerrainInstanceData[] = [];
-    const treeInstancesByChunk = chunks.map(() => ({
-      oak: [] as TreeInstanceData[],
-      pine: [] as TreeInstanceData[],
-      bush: [] as TreeInstanceData[],
-      mushroom: [] as TreeInstanceData[],
-    }));
-    const chunksPerRow = Math.ceil(cols / this.frustumCuller.chunkSize);
-
-    // Height of the surface a neighbouring tile presents, used to decide whether
-    // this tile's sides can be seen. Integer block ids avoid the per-tile string
-    // comparisons this loop used to do.
-    const surfaceHeightAt = (r: number, c: number): number => {
-      if (r < 0 || r >= rows || c < 0 || c >= cols) return -Infinity; // map edge: sides exposed
-      const i = r * cols + c;
-      const id = tileEngine.blockTypeIds[i];
-      if (id === BLOCK_ID_EMPTY) return -Infinity;
-      if (id === BLOCK_ID_MOUNTAIN_LOW || id === BLOCK_ID_MOUNTAIN_HIGH || id === BLOCK_ID_ROCK) {
-        return Infinity; // the unified mountain mesh skirts down to the floor
-      }
-      if (
-        id === BLOCK_ID_TREE_OAK ||
-        id === BLOCK_ID_TREE_PINE ||
-        id === BLOCK_ID_BUSH ||
-        id === BLOCK_ID_MUSHROOM
-      ) {
-        return FOLIAGE_GROUND_HEIGHT;
-      }
-      return tileEngine.heights[i];
+    // Clusters are global: skirt generation has to know whether a neighbouring
+    // mountain tile belongs to the same cluster even across a chunk boundary.
+    this.buildJob = {
+      tileEngine,
+      spritePack,
+      clusters: findMountainClusters(tileEngine),
+      pending: [],
     };
 
-    const pushTerrainInstance = (r: number, c: number, height: number, spriteIndex: number) => {
-      const instance: TerrainInstanceData = {
-        x: c - centerX,
-        y: height / 2 - 0.5,
-        z: r - centerZ,
-        height,
-        spriteIndex,
-      };
-
-      const exposed =
-        surfaceHeightAt(r - 1, c) < height - 1e-4 ||
-        surfaceHeightAt(r + 1, c) < height - 1e-4 ||
-        surfaceHeightAt(r, c - 1) < height - 1e-4 ||
-        surfaceHeightAt(r, c + 1) < height - 1e-4;
-
-      if (exposed) solidInstances.push(instance);
-      else flatInstances.push(instance);
-    };
-
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols; c++) {
-        const idx = tileEngine.getIndex(r, c);
-        const blockId = tileEngine.blockTypeIds[idx];
-        if (blockId === BLOCK_ID_EMPTY) continue;
-
-        const cell = worldGrid[r][c];
-        if (!cell) continue;
-
-        const isTree =
-          blockId === BLOCK_ID_TREE_OAK ||
-          blockId === BLOCK_ID_TREE_PINE ||
-          blockId === BLOCK_ID_BUSH;
-        const isMushroom = blockId === BLOCK_ID_MUSHROOM;
-
-        if (isTree || isMushroom) {
-          pushTerrainInstance(
-            r,
-            c,
-            FOLIAGE_GROUND_HEIGHT,
-            cell.spriteIndex ?? SPRITE_DEFS.grass.spriteIndex
-          );
-
-          const chunkX = Math.floor(c / this.frustumCuller.chunkSize);
-          const chunkZ = Math.floor(r / this.frustumCuller.chunkSize);
-          const treeChunk = treeInstancesByChunk[chunkZ * chunksPerRow + chunkX];
-          const seedVal = r * 31 + c * 17;
-          const pseudoRng = Math.abs(Math.sin(seedVal));
-          const rotY = pseudoRng * Math.PI * 2;
-          const scaleVar = 0.85 + (pseudoRng % 0.3);
-          const instance: TreeInstanceData = {
-            x: c - centerX,
-            y: -0.45,
-            z: r - centerZ,
-            rotY,
-            scaleX: scaleVar,
-            scaleY: blockId === BLOCK_ID_TREE_PINE ? scaleVar * 1.15 : scaleVar,
-            scaleZ: scaleVar,
-          };
-
-          if (blockId === BLOCK_ID_TREE_OAK) treeChunk.oak.push(instance);
-          else if (blockId === BLOCK_ID_TREE_PINE) treeChunk.pine.push(instance);
-          else if (blockId === BLOCK_ID_BUSH) treeChunk.bush.push(instance);
-          else treeChunk.mushroom.push(instance);
-          continue;
-        }
-
-        if (
-          blockId === BLOCK_ID_MOUNTAIN_LOW ||
-          blockId === BLOCK_ID_MOUNTAIN_HIGH ||
-          blockId === BLOCK_ID_ROCK
-        ) {
-          continue; // Handled by the unified mountain mesh.
-        }
-
-        pushTerrainInstance(r, c, tileEngine.heights[idx], tileEngine.spriteIndices[idx]);
-      }
-    }
-
-    const buildTerrainBatch = (
-      instances: TerrainInstanceData[],
-      geometry: THREE.BufferGeometry,
-      materials: THREE.Material | THREE.Material[],
-      name: string
-    ) => {
-      if (instances.length === 0) {
-        geometry.dispose();
-        return;
-      }
-
-      // The geometry is owned by this world, never the shared cache: attaching a
-      // per-world instance attribute to a cached geometry orphans the previous
-      // attribute's GPU buffer on every rebuild.
-      this.ownedGeometries.push(geometry);
-
-      const mesh = this.poolManager.createInstancedMesh(geometry, materials, instances.length);
-      const spriteIndices = new Float32Array(instances.length);
-      _tempQuat_1.identity();
-
-      for (let i = 0; i < instances.length; i++) {
-        const instance = instances[i];
-        _tempVec3_1.set(instance.x, instance.y, instance.z);
-        _tempVec3_2.set(1, instance.height, 1);
-        _tempMat4_1.compose(_tempVec3_1, _tempQuat_1, _tempVec3_2);
-        mesh.setMatrixAt(i, _tempMat4_1);
-        spriteIndices[i] = instance.spriteIndex;
-      }
-
-      geometry.setAttribute(
-        'instanceSpriteIndex',
-        new THREE.InstancedBufferAttribute(spriteIndices, 1).setUsage(THREE.StaticDrawUsage)
-      );
-      mesh.instanceMatrix.setUsage(THREE.StaticDrawUsage);
-      mesh.instanceMatrix.needsUpdate = true;
-      mesh.receiveShadow = true;
-      // Bounds have to be computed across the instances, not just the unit
-      // geometry, for frustum culling to keep the batch on screen.
-      mesh.computeBoundingSphere();
-      mesh.computeBoundingBox();
-      mesh.name = name;
-      this.worldGroup.add(mesh);
-    };
-
-    const sideMaterial = this.poolManager.getOpaqueSideMaterial();
-    const topMaterial = this.poolManager.getTopAtlasMaterial(spritePack);
-
-    // Flat tiles need only the atlas-mapped top: one draw call, 2 triangles each.
-    buildTerrainBatch(
-      flatInstances,
-      this.poolManager.createTerrainTopQuadGeometry(),
-      topMaterial,
-      'BatchedTerrainFlat'
-    );
-    // Everything with a visible side keeps the full block: two draw calls.
-    buildTerrainBatch(
-      solidInstances,
-      this.poolManager.createTerrainBoxGeometry(),
-      [sideMaterial, topMaterial],
-      'BatchedTerrainSolid'
-    );
-
-    chunks.forEach((chunk, chunkIndex) => {
-      const treeInstances = treeInstancesByChunk[chunkIndex];
-
-      // Render low-poly trees per chunk so alpha-tested geometry and shadows cull together.
-      const renderChunkTrees = (type: 'oak' | 'pine' | 'bush' | 'mushroom', instances: TreeInstanceData[]) => {
-        if (instances.length === 0) return;
-
-        const model = this.poolManager.getTreeModel(type, spritePack);
-        const mesh = this.poolManager.createInstancedMesh(model.geometry, model.materials, instances.length);
-        mesh.castShadow = true;
-        mesh.receiveShadow = false;
-
-        for (let i = 0; i < instances.length; i++) {
-          const inst = instances[i];
-          _tempVec3_1.set(inst.x, inst.y, inst.z);
-          _tempEuler_1.set(0, inst.rotY, 0);
-          _tempVec3_2.set(inst.scaleX, inst.scaleY, inst.scaleZ);
-          _tempQuat_1.setFromEuler(_tempEuler_1);
-
-          _tempMat4_1.compose(_tempVec3_1, _tempQuat_1, _tempVec3_2);
-          mesh.setMatrixAt(i, _tempMat4_1);
-        }
-
-        mesh.instanceMatrix.setUsage(THREE.StaticDrawUsage);
-        mesh.instanceMatrix.needsUpdate = true;
-        mesh.computeBoundingSphere();
-        mesh.computeBoundingBox();
-        chunk.group.add(mesh);
-      };
-
-      renderChunkTrees('oak', treeInstances.oak);
-      renderChunkTrees('pine', treeInstances.pine);
-      renderChunkTrees('bush', treeInstances.bush);
-      renderChunkTrees('mushroom', treeInstances.mushroom);
+    // Nearest chunks first, so what the player is looking at appears first.
+    const fx = this.controls.target.x;
+    const fz = this.controls.target.z;
+    const order = chunks.map((chunk, index) => {
+      const cx = (chunk.minX + chunk.maxX) * 0.5 - fx;
+      const cz = (chunk.minZ + chunk.maxZ) * 0.5 - fz;
+      return { index, distSq: cx * cx + cz * cz };
     });
+    order.sort((a, b) => a.distSq - b.distSq);
+    for (let i = 0; i < order.length; i++) this.buildJob.pending.push(order[i].index);
 
-    // 3. Render Unified Mountain Mesh Group
-    const unifiedMountainGroup = buildUnifiedMountainMeshGroup(worldGrid, spritePack);
-    this.worldGroup.add(unifiedMountainGroup);
+    // Build within a time budget, then let updateFrame finish the rest. Small
+    // worlds complete in one go; large ones stream in instead of freezing.
+    this.drainBuildQueue(INITIAL_BUILD_BUDGET_MS);
 
     // Place the adventurer at the dungeon centre. If the exact centre is
     // occupied by terrain, walk outward to the nearest walkable cell so the
@@ -693,11 +757,11 @@ export class TileRenderer {
           if (Math.max(Math.abs(dr), Math.abs(dc)) !== radius) continue;
           const row = centreRow + dr;
           const col = centreCol + dc;
-          const cell = worldGrid[row]?.[col];
-          if (!cell || cell.type.startsWith('mountain') || cell.type === 'rock' || cell.type.startsWith('tree_') || cell.type === 'bush') continue;
+          const blockId = tileEngine.blockAt(row, col);
+          if (blockId === BLOCK_ID_EMPTY || isMountainBlock(blockId) || isFoliageBlock(blockId)) continue;
           playerX = col - centerX;
           playerZ = row - centerZ;
-          playerHeight = cell.height || 0;
+          playerHeight = tileEngine.heightAt(row, col);
           found = true;
         }
       }
@@ -723,7 +787,10 @@ export class TileRenderer {
     this.lastTargetZ = NaN;
     this.dirLight.shadow.needsUpdate = true;
 
-    this.rebuildFakeLightTint(worldGrid);
+    // The tint layer is only visible in fake-lighting mode, and baking it costs
+    // ~22 ms at 256x256. Defer it until something actually needs it.
+    this.buildTileEngine = tileEngine;
+    this.tintDirty = true;
 
     this.centerLight.position.set(0, 20, 0);
     this.applyTheme(theme);
@@ -747,7 +814,7 @@ export class TileRenderer {
    * positions. This used to re-run the whole rows x cols x emitters loop every
    * third frame and produce exactly the same numbers each time.
    */
-  private rebuildFakeLightTint(worldGrid: any[][]): void {
+  private rebuildFakeLightTint(tileEngine: TileDataEngine): void {
     const rows = this.rows;
     const cols = this.cols;
     const totalCells = rows * cols;
@@ -813,8 +880,7 @@ export class TileRenderer {
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
         const idx = r * cols + c;
-        const cell = worldGrid[r]?.[c];
-        const tileH = cell ? cell.height || 0 : 0;
+        const tileH = tileEngine.heights[idx];
         this.tileHeights[idx] = tileH;
 
         const worldX = c - this.centerX;
@@ -999,6 +1065,11 @@ export class TileRenderer {
         this.lightPool[i].visible = false;
       }
 
+      if (this.tintDirty && this.buildTileEngine && !this.isBuilding) {
+        this.rebuildFakeLightTint(this.buildTileEngine);
+        this.tintDirty = false;
+      }
+
       this.computeFakeLighting();
       this.lastLightType = 'fake';
 
@@ -1180,6 +1251,9 @@ export class TileRenderer {
       this.lastLightType = 'realtime';
     }
 
+    // 5b. Continue any in-flight world build within this frame's budget.
+    this.drainBuildQueue(PER_FRAME_BUILD_BUDGET_MS);
+
     // 6. Force current frame matrices update for camera and world
     if (this.activeCamera) this.activeCamera.updateMatrixWorld();
     this.worldGroup.updateMatrixWorld(true);
@@ -1261,6 +1335,10 @@ export class TileRenderer {
       this.ownedGeometries[i].dispose();
     }
     this.ownedGeometries.length = 0;
+    for (let i = 0; i < this.ownedMaterials.length; i++) {
+      this.ownedMaterials[i].dispose();
+    }
+    this.ownedMaterials.length = 0;
 
     this.adventurerMaterial?.dispose();
     this.adventurerMaterial = null;

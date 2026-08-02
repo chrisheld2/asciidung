@@ -4,9 +4,9 @@ import { HUDControls } from './components/HUDControls';
 // Neither the pause panel (1.8k lines) nor its icon set is needed for first
 // paint, so they load on first open instead of shipping in the entry chunk.
 const PauseScreen = lazy(() => import('./components/PauseScreen'));
-import { COLOR_THEMES, SPRITE_PACKS, generateNaturalWorld, playTerminalBeep } from './utils/sprites';
+import { COLOR_THEMES, SPRITE_PACKS, playTerminalBeep } from './utils/sprites';
 import { setUse3DSpriteTrees } from './utils/treeModels';
-import { ColorTheme, WorldCell, MazeStats, CameraPreset, SpritePackType, PauseTab, DayNightState, LightType } from './types';
+import { ColorTheme, MazeStats, CameraPreset, SpritePackType, PauseTab, DayNightState, LightType, WorldSpec } from './types';
 
 const SETTINGS_STORAGE_KEY = 'spritedung_user_settings_v1';
 
@@ -45,7 +45,11 @@ function loadSavedSettings(): StoredUserSettings {
 export default function App() {
   const initialSettings = loadSavedSettings();
 
-  const [worldGrid, setWorldGrid] = useState<WorldCell[][]>(() => generateNaturalWorld(64, 64, 42424));
+  // Only the recipe for the world lives in React state, never the world itself.
+  // The generated grid is 4,096 objects at 64x64 and over a million at 1024x1024;
+  // it is now a transient inside the generation effect, consumed into typed
+  // arrays and dropped. `version` forces a rebuild when nothing else changed.
+  const [world, setWorld] = useState<WorldSpec>({ seed: 42424, rows: 64, cols: 64, version: 0 });
   const [theme, setTheme] = useState<ColorTheme>(() => {
     return COLOR_THEMES.find((t) => t.id === initialSettings.themeId) || COLOR_THEMES.find((t) => t.id === 'natural') || COLOR_THEMES[0];
   });
@@ -114,7 +118,7 @@ export default function App() {
   const handleToggle3DSpriteTrees = useCallback((enable: boolean) => {
     setUse3DSpriteTrees(enable);
     setUse3DSpriteTreesState(enable);
-    setWorldGrid((prev) => [...prev]);
+    setWorld((prev) => ({ ...prev, version: prev.version + 1 }));
   }, []);
 
   // Turn Step Handler
@@ -298,11 +302,18 @@ export default function App() {
     totalBlocks: 4096,
     translucentWalls: 0,
     opaqueWalls: 4096,
+    treeCount: 0,
+    dirtCount: 0,
+    waterCount: 0,
+    ruinCount: 0,
+    mountainCount: 0,
+    chestCount: 0,
+    specialCount: 0,
+    tallBlockCount: 0,
   });
 
   const handleRegenerateWorld = useCallback(() => {
-    const newGrid = generateNaturalWorld(64, 64);
-    setWorldGrid(newGrid);
+    setWorld((prev) => ({ ...prev, seed: Math.floor(Math.random() * 1000000), version: prev.version + 1 }));
   }, []);
 
   const handleCenterCamera = useCallback(() => {
@@ -357,7 +368,7 @@ export default function App() {
 
       {/* 3D Canvas Scene */}
       <ASCIIMazeCanvas
-        worldGrid={worldGrid}
+        world={world}
         theme={theme}
         spritePack={spritePack}
         translucencyRatio={translucencyRatio}
