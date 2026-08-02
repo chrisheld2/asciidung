@@ -81,8 +81,10 @@ function hexToRGB(hex: string): [number, number, number] {
   return [(num >> 16 & 255) / 255, (num >> 8 & 255) / 255, (num & 255) / 255];
 }
 
-// Generate height map value for any continuous grid coordinate (x, z)
-function getMountainHeightAt(
+// Generate height map value for any continuous grid coordinate (x, z).
+// Exported so pointer picking can evaluate the same displaced surface the mesh
+// was generated from, instead of raycasting its triangles.
+export function getMountainHeightAt(
   x: number,
   z: number,
   tileEngine: TileDataEngine,

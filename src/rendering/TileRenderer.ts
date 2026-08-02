@@ -7,12 +7,18 @@ import {
   BLOCK_ID_TREE_OAK,
   BLOCK_ID_TREE_PINE,
   BLOCK_ID_BUSH,
+  BLOCK_ID_MOUNTAIN_HIGH,
   isFoliageBlock,
   isMountainBlock,
 } from './TileData';
 import { TilePoolManager } from './TilePoolManager';
 import { FrustumCuller } from './FrustumCuller';
-import { findMountainClusters, buildMountainMeshForRegion, MountainCluster } from '../utils/mountainMesh';
+import {
+  findMountainClusters,
+  buildMountainMeshForRegion,
+  getMountainHeightAt,
+  MountainCluster,
+} from '../utils/mountainMesh';
 import { SPRITE_DEFS } from '../utils/spriteDefs';
 import { EntityStore, EntityType } from '../game/EntityStore';
 import { UpdateScheduler } from '../game/UpdateScheduler';
@@ -30,6 +36,13 @@ const MAX_FAKE_LIGHT_EMITTERS = 24;
 // so a single-chunk world (the 64x64 default) still finishes in one call.
 const INITIAL_BUILD_BUDGET_MS = 8;
 const PER_FRAME_BUILD_BUDGET_MS = 4;
+
+// Pointer picking walks the heightfield between these bounds. The step is half a
+// tile, which is finer than the tile grid the surface is defined on.
+const PICK_STEP = 0.5;
+const PICK_CEILING_Y = 12;
+const PICK_MAX_DISTANCE = 800;
+const FLOOR_Y = -0.5;
 
 // Entities have no behaviour yet; the scheduler is wired up and banding so that
 // gameplay systems slot in without revisiting the frame loop.
@@ -59,10 +72,6 @@ const _rightVec = new THREE.Vector3();
 const _upVec = new THREE.Vector3();
 const _forwardVec = new THREE.Vector3();
 const _panDeltaVec = new THREE.Vector3();
-
-// Reused across pointer picks so a moving cursor allocates nothing.
-const _raycastTargets: THREE.Object3D[] = [];
-const _raycastHits: THREE.Intersection[] = [];
 
 // Hoisted so sorting the emitter list does not allocate a closure per call.
 const byDistanceSq = (a: LightEmitter, b: LightEmitter) => (a.distSq || 0) - (b.distSq || 0);
@@ -376,8 +385,73 @@ export class TileRenderer {
   }
 
   /**
-   * Cast the most recent pointer position through the active camera and place
-   * the cursor light just above the first piece of world geometry it hits.
+   * Height of the world surface at a grid cell, matching what the mesh builders
+   * produced. Mountains are evaluated from the same displacement function the
+   * mountain mesh was generated from rather than from their base tile height.
+   */
+  private surfaceHeightForPick(engine: TileDataEngine, r: number, c: number): number {
+    const id = engine.blockAt(r, c);
+    if (id === BLOCK_ID_EMPTY) return FLOOR_Y;
+
+    if (isMountainBlock(id)) {
+      const worldX = c - this.centerX;
+      const worldZ = r - this.centerZ;
+      const apexBoost = id === BLOCK_ID_MOUNTAIN_HIGH ? 0.6 : 0.35;
+      return getMountainHeightAt(worldX, worldZ, engine, this.centerX, this.centerZ) + apexBoost;
+    }
+
+    if (isFoliageBlock(id)) return FOLIAGE_GROUND_HEIGHT - 0.5;
+    return engine.heightAt(r, c) - 0.5;
+  }
+
+  /**
+   * Find where the pointer ray meets the world, by marching the heightfield.
+   *
+   * The world is a heightfield, so this is a short walk down the ray comparing
+   * against tile heights - independent of how many instances or triangles exist.
+   * Raycasting the scene instead cost about a millisecond per frame while the
+   * pointer moved, over ten times the cost of the rest of the frame, and it grew
+   * with world size.
+   */
+  private pickWorldPoint(out: THREE.Vector3): boolean {
+    const engine = this.buildTileEngine;
+    if (!engine) return false;
+
+    const origin = _mouseRaycaster.ray.origin;
+    const dir = _mouseRaycaster.ray.direction;
+
+    // Only walk the span where the ray is within the world's vertical band.
+    let tStart = 0;
+    let tEnd = PICK_MAX_DISTANCE;
+    if (Math.abs(dir.y) > 1e-6) {
+      const tTop = (PICK_CEILING_Y - origin.y) / dir.y;
+      const tBottom = (FLOOR_Y - origin.y) / dir.y;
+      tStart = Math.max(0, Math.min(tTop, tBottom));
+      tEnd = Math.min(PICK_MAX_DISTANCE, Math.max(tTop, tBottom));
+    }
+    if (tEnd <= tStart) return false;
+
+    for (let t = tStart; t <= tEnd; t += PICK_STEP) {
+      const wx = origin.x + dir.x * t;
+      const wy = origin.y + dir.y * t;
+      const wz = origin.z + dir.z * t;
+
+      const c = Math.round(wx + this.centerX);
+      const r = Math.round(wz + this.centerZ);
+      const surface = this.surfaceHeightForPick(engine, r, c);
+
+      if (wy <= surface) {
+        out.set(wx, surface, wz);
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Resolve the most recent pointer position and place the cursor light just
+   * above the world surface it lands on.
    */
   private resolvePointerLight(): void {
     if (!this.hasPendingPointer) return;
@@ -394,25 +468,16 @@ export class TileRenderer {
     // Matrices are already current: updateFrame refreshes them before this runs.
     _mouseRaycaster.setFromCamera(_mouseNdc, this.activeCamera);
 
-    _raycastTargets.length = 0;
-    _raycastTargets.push(this.worldGroup);
-    if (this.floorMesh) _raycastTargets.push(this.floorMesh);
-
-    _raycastHits.length = 0;
-    _mouseRaycaster.intersectObjects(_raycastTargets, true, _raycastHits);
-
-    if (_raycastHits.length === 0) {
+    if (!this.pickWorldPoint(_mouseLightHit)) {
       this.mouseLightActive = false;
       this.mouseLight.visible = false;
       return;
     }
 
-    _mouseLightHit.copy(_raycastHits[0].point);
     _mouseLightHit.y += 1.25;
     this.mouseLight.position.copy(_mouseLightHit);
     this.mouseLightActive = true;
     this.mouseLight.visible = this.lightType === 'realtime';
-    _raycastHits.length = 0;
   }
 
   /**
