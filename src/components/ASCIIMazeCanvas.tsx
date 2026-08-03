@@ -233,6 +233,8 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
   }, [autoRotate]);
 
   const isPausedRef = useRef(isPaused);
+  const animationFrameIdRef = useRef<number | null>(null);
+  const animationLoopRef = useRef<(() => void) | null>(null);
   useEffect(() => {
     isPausedRef.current = isPaused;
   }, [isPaused]);
@@ -404,22 +406,19 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
     handleResize();
 
     // ZERO-ALLOCATION Animation Loop
-    let animationFrameId: number;
     let lastFpsTime = performance.now();
     let lastFrameTime = performance.now();
     let frameCount = 0;
 
     const animate = () => {
-      animationFrameId = requestAnimationFrame(animate);
-
-      // Keep the animation loop alive so closing the pause menu resumes immediately,
-      // but do not update the scene or issue WebGL renders while the game is paused.
+      // Do not keep a requestAnimationFrame chain alive while the pause menu is open.
+      // This stops the game loop entirely instead of merely skipping its work.
       if (isPausedRef.current) {
-        lastFrameTime = performance.now();
-        frameCount = 0;
-        lastFpsTime = lastFrameTime;
+        animationFrameIdRef.current = null;
         return;
       }
+
+      animationFrameIdRef.current = requestAnimationFrame(animate);
 
       const now = performance.now();
       const delta = Math.min(0.05, (now - lastFrameTime) / 1000);
@@ -444,14 +443,15 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
 
       tileRenderer.updateFrame(
         delta,
-        isPausedRef.current,
+        false,
         autoRotateRef.current,
         dayNightStateRef.current,
         pressedKeysRef.current
       );
     };
 
-    animate();
+    animationLoopRef.current = animate;
+    if (!isPausedRef.current) animate();
 
     return () => {
       if (hasInitializedCameraRef.current) {
@@ -468,7 +468,11 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
       window.removeEventListener('beforeunload', handleUnload);
       window.removeEventListener('pagehide', handleUnload);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
-      cancelAnimationFrame(animationFrameId);
+      if (animationFrameIdRef.current !== null) {
+        cancelAnimationFrame(animationFrameIdRef.current);
+        animationFrameIdRef.current = null;
+      }
+      animationLoopRef.current = null;
       tileRenderer.controls.removeEventListener('change', handleControlsChange);
       tileRenderer.renderer.domElement.removeEventListener('pointermove', handlePointerMove);
       tileRenderer.renderer.domElement.removeEventListener('pointerleave', handlePointerLeave);
@@ -478,6 +482,21 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
       rendererInstanceRef.current = null;
     };
   }, []);
+
+  // Pausing cancels the RAF chain completely. Resuming starts a fresh chain.
+  useEffect(() => {
+    if (isPaused) {
+      if (animationFrameIdRef.current !== null) {
+        cancelAnimationFrame(animationFrameIdRef.current);
+        animationFrameIdRef.current = null;
+      }
+      return;
+    }
+
+    if (animationFrameIdRef.current === null) {
+      animationLoopRef.current?.();
+    }
+  }, [isPaused]);
 
   const prevStatsJsonRef = useRef<string>('');
 
