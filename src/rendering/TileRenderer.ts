@@ -1062,6 +1062,14 @@ export class TileRenderer {
         speed = dist * 0.012;
       }
 
+      // Project the camera's right and forward vectors onto the horizontal XZ
+      // plane so WASD always pans across the land and never changes the
+      // camera's height or view distance, regardless of camera angle.
+      _rightVec.y = 0;
+      _rightVec.normalize();
+      _forwardVec.y = 0;
+      _forwardVec.normalize();
+
       _panDeltaVec.set(0, 0, 0);
 
       if (pressedKeys.has('arrowleft') || pressedKeys.has('a')) {
@@ -1071,10 +1079,10 @@ export class TileRenderer {
         _panDeltaVec.addScaledVector(_rightVec, speed);
       }
       if (pressedKeys.has('arrowup') || pressedKeys.has('w')) {
-        _panDeltaVec.addScaledVector(_upVec, speed);
+        _panDeltaVec.addScaledVector(_forwardVec, -speed);
       }
       if (pressedKeys.has('arrowdown') || pressedKeys.has('s')) {
-        _panDeltaVec.addScaledVector(_upVec, -speed);
+        _panDeltaVec.addScaledVector(_forwardVec, speed);
       }
 
       if (_panDeltaVec.lengthSq() > 0) {
