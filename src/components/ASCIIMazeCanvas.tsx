@@ -235,6 +235,11 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
   const isPausedRef = useRef(isPaused);
   useEffect(() => {
     isPausedRef.current = isPaused;
+    // Restart the rAF loop when unpausing. While paused the animate loop exits
+    // without scheduling another frame, so no rendering or processing happens.
+    if (!isPaused && animateRef.current && animationFrameIdRef.current === 0) {
+      animationFrameIdRef.current = requestAnimationFrame(animateRef.current);
+    }
   }, [isPaused]);
 
   const dayNightStateRef = useRef(dayNightState);
@@ -264,6 +269,8 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
   const isInitialPresetRef = useRef(true);
   const prevCenterTriggerRef = useRef(centerCameraTrigger);
   const pressedKeysRef = useRef<Set<string>>(new Set());
+  const animateRef = useRef<(() => void) | null>(null);
+  const animationFrameIdRef = useRef<number>(0);
 
   // Driven straight through the DOM. A transient toast that fires every few
   // seconds while the camera moves does not need to re-render the component
@@ -371,7 +378,7 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
     // Keep a durable checkpoint even when the camera changes without an
     // OrbitControls change event (for example while auto-rotation is active).
     const cameraSaveInterval = window.setInterval(() => {
-      if (hasInitializedCameraRef.current) {
+      if (hasInitializedCameraRef.current && !isPausedRef.current) {
         if (saveCameraStateImmediate(tileRenderer, isOrthographicRef.current)) {
           showCameraSaveToast();
         }
@@ -403,23 +410,20 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
     window.addEventListener('resize', handleResize);
     handleResize();
 
-    // ZERO-ALLOCATION Animation Loop
-    let animationFrameId: number;
+    // ZERO-ALLOCATION Animation Loop. The loop stops entirely while the game
+    // is paused — no rAF callback, no scene update, no WebGL render. The
+    // isPaused effect below restarts it when the pause menu closes.
     let lastFpsTime = performance.now();
     let lastFrameTime = performance.now();
     let frameCount = 0;
 
     const animate = () => {
-      animationFrameId = requestAnimationFrame(animate);
-
-      // Keep the animation loop alive so closing the pause menu resumes immediately,
-      // but do not update the scene or issue WebGL renders while the game is paused.
       if (isPausedRef.current) {
-        lastFrameTime = performance.now();
-        frameCount = 0;
-        lastFpsTime = lastFrameTime;
+        animationFrameIdRef.current = 0;
         return;
       }
+
+      animationFrameIdRef.current = requestAnimationFrame(animate);
 
       const now = performance.now();
       const delta = Math.min(0.05, (now - lastFrameTime) / 1000);
@@ -451,6 +455,7 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
       );
     };
 
+    animateRef.current = animate;
     animate();
 
     return () => {
@@ -468,7 +473,8 @@ export const ASCIIMazeCanvas: React.FC<ASCIIMazeCanvasProps> = ({
       window.removeEventListener('beforeunload', handleUnload);
       window.removeEventListener('pagehide', handleUnload);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
-      cancelAnimationFrame(animationFrameId);
+      cancelAnimationFrame(animationFrameIdRef.current);
+      animateRef.current = null;
       tileRenderer.controls.removeEventListener('change', handleControlsChange);
       tileRenderer.renderer.domElement.removeEventListener('pointermove', handlePointerMove);
       tileRenderer.renderer.domElement.removeEventListener('pointerleave', handlePointerLeave);
