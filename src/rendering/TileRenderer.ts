@@ -68,7 +68,9 @@ const _mouseNdc = new THREE.Vector2();
 const _mouseRaycaster = new THREE.Raycaster();
 const _mouseLightHit = new THREE.Vector3();
 
-const _worldUpVec = new THREE.Vector3(0, 1, 0);
+const _rightVec = new THREE.Vector3();
+const _upVec = new THREE.Vector3();
+const _forwardVec = new THREE.Vector3();
 const _panDeltaVec = new THREE.Vector3();
 
 // Hoisted so sorting the emitter list does not allocate a closure per call.
@@ -1011,7 +1013,7 @@ export class TileRenderer {
       _tempVec3_1.set(e.x, e.y + 0.5, e.z);
       const ePulse = 0.5 + Math.sin(this.time * 4.0 + i) * 0.1;
       _tempVec3_2.set(ePulse, ePulse, ePulse);
-      _tempQuat_1.setFromAxisAngle(_worldUpVec, this.time * 1.5 + i);
+      _tempQuat_1.setFromAxisAngle(_upVec, this.time * 1.5 + i);
       _tempMat4_1.compose(_tempVec3_1, _tempQuat_1, _tempVec3_2);
 
       this.fakeLightSourcesMesh.setMatrixAt(sourceIdx, _tempMat4_1);
@@ -1043,15 +1045,13 @@ export class TileRenderer {
 
     this.poolManager.updateWaterAnimation(this.time);
 
-    // 1. WASD / Arrow Key Camera Movement with ZERO allocations.
-    //
-    // Keyboard panning is deliberately in world space, not camera space:
-    // left/right always move on X and up/down always move on Z. Translating
-    // the camera and orbit target by the same X/Z delta keeps the camera's
-    // angle, height, and zoom distance unchanged regardless of its rotation.
+    // 1. WASD / Arrow Key Camera Movement with ZERO allocations
     if (!isPaused && pressedKeys.size > 0 && this.activeCamera && this.controls) {
       const cam = this.activeCamera;
       const controls = this.controls;
+
+      cam.updateMatrixWorld();
+      cam.matrixWorld.extractBasis(_rightVec, _upVec, _forwardVec);
 
       let speed = 0.6;
       if (cam instanceof THREE.OrthographicCamera) {
@@ -1065,16 +1065,16 @@ export class TileRenderer {
       _panDeltaVec.set(0, 0, 0);
 
       if (pressedKeys.has('arrowleft') || pressedKeys.has('a')) {
-        _panDeltaVec.x -= speed;
+        _panDeltaVec.addScaledVector(_rightVec, -speed);
       }
       if (pressedKeys.has('arrowright') || pressedKeys.has('d')) {
-        _panDeltaVec.x += speed;
+        _panDeltaVec.addScaledVector(_rightVec, speed);
       }
       if (pressedKeys.has('arrowup') || pressedKeys.has('w')) {
-        _panDeltaVec.z -= speed;
+        _panDeltaVec.addScaledVector(_upVec, speed);
       }
       if (pressedKeys.has('arrowdown') || pressedKeys.has('s')) {
-        _panDeltaVec.z += speed;
+        _panDeltaVec.addScaledVector(_upVec, -speed);
       }
 
       if (_panDeltaVec.lengthSq() > 0) {
